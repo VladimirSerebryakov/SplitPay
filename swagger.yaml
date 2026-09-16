@@ -1,0 +1,1178 @@
+openapi: 3.0.3
+info:
+  title: SplitPay API
+  version: 1.0.0
+  description: |
+    API сервиса учёта групповых расходов и расчёта долгов (аналог Splitwise).
+
+    **Общие правила**
+    - Базовый путь: `/api/v1`. Все тела запросов и ответов — JSON (`Content-Type: application/json`).
+    - Все денежные суммы — **целые числа в копейках** (`150050` = 1500,50 ₽). Валюта одна — рубль.
+    - Идентификаторы — UUID. Время — RFC 3339 в UTC.
+    - Защищённые ручки требуют `Authorization: Bearer <access_token>`.
+    - Ручки `/groups/{groupId}/...` доступны только участникам группы (иначе `403 forbidden`).
+    - Изменяющие ручки с деньгами требуют заголовок `Idempotency-Key` (UUID, один на действие пользователя,
+      тот же при повторах). Повтор с тем же ключом вернёт сохранённый ответ; тот же ключ с другим телом — `422`.
+    - Списки используют keyset-пагинацию: `limit` + `cursor`, в ответе `next_cursor` (`null` — страниц больше нет).
+    - Все ошибки — в едином формате `Error` (см. схемы).
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Локальная разработка
+
+tags:
+  - name: Auth
+    description: Регистрация, вход, токены
+  - name: Me
+    description: Профиль текущего пользователя и привязка Telegram
+  - name: Groups
+    description: Группы, участники, приглашения
+  - name: Expenses
+    description: Расходы (чеки)
+  - name: Repayments
+    description: Переводы денег между участниками
+  - name: Balances & Settlement
+    description: Балансы, план расчёта, лента группы
+  - name: Attachments
+    description: Загрузка чеков и скриншотов переводов в S3
+  - name: Internal
+    description: Служебные ручки (Telegram webhook, health-checks)
+
+paths:
+  # ============================== Auth ==============================
+  /auth/sign-up:
+    post:
+      tags: [Auth]
+      summary: Регистрация
+      operationId: signUp
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SignUpRequest" }
+      responses:
+        "201":
+          description: Пользователь создан
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409":
+          description: Email уже занят (`email_taken`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /auth/sign-in:
+    post:
+      tags: [Auth]
+      summary: Вход
+      operationId: signIn
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SignInRequest" }
+      responses:
+        "200":
+          description: Пара токенов
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenPair" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: Неверный email или пароль (`invalid_credentials`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Обновить пару токенов (ротация refresh)
+      description: Старый refresh-токен отзывается. Повторное использование того же токена → `401`.
+      operationId: refreshTokens
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "200":
+          description: Новая пара токенов
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenPair" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: Refresh-токен неверный, отозван или истёк (`invalid_refresh_token`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Выйти (отозвать refresh-токен)
+      description: Идемпотентно — неизвестный или уже отозванный токен тоже даёт `204`.
+      operationId: logout
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "204": { description: "Сессия отозвана" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  # ============================== Me ==============================
+  /me:
+    get:
+      tags: [Me]
+      summary: Мой профиль
+      operationId: getMe
+      responses:
+        "200":
+          description: Профиль
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+    patch:
+      tags: [Me]
+      summary: Изменить имя
+      operationId: updateMe
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateMeRequest" }
+      responses:
+        "200":
+          description: Обновлённый профиль
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /me/telegram/link:
+    post:
+      tags: [Me]
+      summary: Получить ссылку для привязки Telegram
+      description: |
+        Создаёт одноразовый токен (TTL 10 мин). Пользователь открывает ссылку и нажимает Start в боте —
+        привязка завершится через webhook. Повторный вызов выдаёт новую ссылку; старая продолжает
+        действовать до истечения TTL. Если Telegram уже привязан, новая привязка заменит старую.
+      operationId: createTelegramLink
+      responses:
+        "201":
+          description: Ссылка на бота
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TelegramLink" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /me/telegram:
+    delete:
+      tags: [Me]
+      summary: Отвязать Telegram
+      description: Идемпотентно — если привязки нет, тоже `204`.
+      operationId: unlinkTelegram
+      responses:
+        "204": { description: "Привязка удалена" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  # ============================== Groups ==============================
+  /groups:
+    post:
+      tags: [Groups]
+      summary: Создать группу
+      description: Создатель становится участником с ролью `owner`.
+      operationId: createGroup
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyOptional"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateGroupRequest" }
+      responses:
+        "201":
+          description: Группа создана
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GroupDetails" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/IdempotencyMismatch" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/Internal" }
+    get:
+      tags: [Groups]
+      summary: Мои группы
+      description: Все группы пользователя, новые сверху. Баланс — из проекции (может отставать на доли секунды).
+      operationId: listMyGroups
+      responses:
+        "200":
+          description: Список групп
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/GroupSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /groups/join:
+    post:
+      tags: [Groups]
+      summary: Вступить в группу по приглашению
+      description: Идемпотентно — если пользователь уже участник, вернётся та же группа с `200`.
+      operationId: joinGroup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/JoinGroupRequest" }
+      responses:
+        "200":
+          description: Группа, в которую вступил пользователь
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GroupDetails" }
+        "400":
+          description: Ошибка валидации или приглашение истекло (`validation_failed`, `invite_expired`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: Приглашение не найдено или отозвано (`not_found`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /groups/{groupId}:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    get:
+      tags: [Groups]
+      summary: Группа и участники
+      operationId: getGroup
+      responses:
+        "200":
+          description: Детали группы
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GroupDetails" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /groups/{groupId}/invite:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    post:
+      tags: [Groups]
+      summary: Выпустить приглашение (только owner)
+      description: |
+        Создаёт новую ссылку-приглашение на 24 часа. Предыдущая ссылка группы сразу перестаёт действовать.
+        Токен показывается **только в этом ответе** — в БД хранится его хеш.
+      operationId: createInvite
+      responses:
+        "201":
+          description: Приглашение
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Invite" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+    delete:
+      tags: [Groups]
+      summary: Отозвать приглашение (только owner)
+      description: Идемпотентно — если приглашения нет, тоже `204`.
+      operationId: revokeInvite
+      responses:
+        "204": { description: "Приглашение отозвано" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  # ============================== Expenses ==============================
+  /groups/{groupId}/expenses:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    post:
+      tags: [Expenses]
+      summary: Добавить расход
+      description: |
+        - `payer_id` — кто заплатил; по умолчанию текущий пользователь. Должен быть участником группы.
+        - Плательщик может не входить в число тех, на кого делится расход («заплатил за друзей»).
+        - `equal`: сумма делится поровну между `participant_ids`; копеечный остаток один раз случайно
+          распределяется по участникам (по 1 коп.) и сохраняется — повторно доли не пересчитываются.
+        - `exact`: сумма долей должна совпасть с `amount`, иначе `400 validation_failed`.
+        - Редактировать расход нельзя, только удалить и создать заново.
+        - В ответе — итоговые доли каждого участника.
+      operationId: createExpense
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateExpenseRequest" }
+      responses:
+        "201":
+          description: Расход создан
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Expense" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/IdempotencyMismatch" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/Internal" }
+    get:
+      tags: [Expenses]
+      summary: Расходы группы
+      description: Только неудалённые, новые сверху.
+      operationId: listExpenses
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Страница расходов
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ExpensePage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /groups/{groupId}/expenses/{expenseId}:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+      - $ref: "#/components/parameters/ExpenseId"
+    get:
+      tags: [Expenses]
+      summary: Расход с долями и чеком
+      description: Удалённый расход → `404`. Ссылка на чек (`attachment.download_url`) действует 15 минут.
+      operationId: getExpense
+      responses:
+        "200":
+          description: Расход
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Expense" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+    delete:
+      tags: [Expenses]
+      summary: Удалить расход (только автор)
+      description: |
+        Мягкое удаление. Идемпотентно: повторное удаление своего уже удалённого расхода — тоже `204`.
+        Удалить чужой расход → `403`.
+      operationId: deleteExpense
+      responses:
+        "204": { description: "Расход удалён" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  # ============================== Repayments ==============================
+  /groups/{groupId}/repayments:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    post:
+      tags: [Repayments]
+      summary: Записать перевод
+      description: |
+        Факт передачи денег (банком или наличными). Записать может только **отправитель или получатель**
+        (текущий пользователь должен совпадать с `from_user_id` или `to_user_id`), иначе `403`.
+        Оба — участники группы, `from_user_id ≠ to_user_id`.
+        Кнопка «Оплачено» в плане расчёта создаёт именно перевод.
+      operationId: createRepayment
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateRepaymentRequest" }
+      responses:
+        "201":
+          description: Перевод записан
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Repayment" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/IdempotencyMismatch" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/Internal" }
+    get:
+      tags: [Repayments]
+      summary: Переводы группы
+      description: Только неудалённые, новые сверху.
+      operationId: listRepayments
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Страница переводов
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RepaymentPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /groups/{groupId}/repayments/{repaymentId}:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+      - $ref: "#/components/parameters/RepaymentId"
+    get:
+      tags: [Repayments]
+      summary: Перевод со скриншотом
+      operationId: getRepayment
+      responses:
+        "200":
+          description: Перевод
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Repayment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+    delete:
+      tags: [Repayments]
+      summary: Удалить перевод (только автор записи)
+      description: Мягкое удаление, идемпотентно. Удалить чужую запись → `403`.
+      operationId: deleteRepayment
+      responses:
+        "204": { description: "Перевод удалён" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  # ============================== Balances & Settlement ==============================
+  /groups/{groupId}/balances:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    get:
+      tags: [Balances & Settlement]
+      summary: Балансы участников (для показа)
+      description: |
+        Берутся из проекции, которую строит Balance worker, поэтому могут отставать на доли секунды
+        (`updated_at`). Для точного расчёта используйте `/settlement`.
+      operationId: getBalances
+      responses:
+        "200":
+          description: Балансы
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Balances" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /groups/{groupId}/settlement:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    get:
+      tags: [Balances & Settlement]
+      summary: План расчёта «кто кому сколько перевести»
+      description: |
+        Балансы считаются честно по расходам и переводам (не по проекции), затем алгоритм сжатия
+        переводов строит минимальный план. Ничего не меняет в данных.
+        - `auto` — точный алгоритм, если участников с ненулевым балансом не больше порога, иначе жадный.
+        - `exact` при превышении порога → `422 too_many_participants`.
+      operationId: getSettlement
+      parameters:
+        - name: algorithm
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [auto, greedy, exact]
+            default: auto
+      responses:
+        "200":
+          description: План расчёта
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SettlementPlan" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422":
+          description: Для точного алгоритма слишком много участников (`too_many_participants`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /groups/{groupId}/activity:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    get:
+      tags: [Balances & Settlement]
+      summary: Лента группы
+      description: События группы, новые сверху. Строится Activity worker и может отставать на доли секунды.
+      operationId: getActivity
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Страница ленты
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActivityPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  # ============================== Attachments ==============================
+  /attachments/upload-url:
+    post:
+      tags: [Attachments]
+      summary: Получить ссылку для загрузки файла в S3
+      description: |
+        1. Получить `upload_url` (действует 10 минут).
+        2. Загрузить файл напрямую в S3: `PUT upload_url` с заголовками из `headers` и телом-файлом.
+        3. Передать `attachment_id` при создании расхода или перевода.
+
+        Неприкреплённые вложения удаляются через 24 часа. Одно вложение можно прикрепить только один раз.
+      operationId: createUploadUrl
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateUploadUrlRequest" }
+      responses:
+        "201":
+          description: Ссылка для загрузки
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UploadUrl" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  # ============================== Internal ==============================
+  /telegram/webhook:
+    post:
+      tags: [Internal]
+      summary: Webhook Telegram Bot API
+      description: |
+        Вызывается только Telegram. Без JWT; проверяется заголовок `X-Telegram-Bot-Api-Secret-Token`.
+        Обрабатывается команда `/start <token>` (привязка аккаунта). На любое корректно подписанное
+        обновление отвечаем `200`, даже если оно нам не интересно, — иначе Telegram будет повторять запрос.
+      operationId: telegramWebhook
+      security:
+        - TelegramSecret: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TelegramUpdate" }
+      responses:
+        "200": { description: "Обновление принято" }
+        "401":
+          description: Неверный секрет (`unauthorized`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /healthz:
+    get:
+      tags: [Internal]
+      summary: Процесс жив (liveness)
+      operationId: healthz
+      security: []
+      responses:
+        "200": { description: "OK" }
+
+  /readyz:
+    get:
+      tags: [Internal]
+      summary: Готов принимать запросы (Postgres и Redis доступны)
+      operationId: readyz
+      security: []
+      responses:
+        "200": { description: "Готов" }
+        "503": { description: "Зависимости недоступны" }
+
+# ================================================================
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access-токен из `/auth/sign-in` или `/auth/refresh`, живёт 15 минут.
+    TelegramSecret:
+      type: apiKey
+      in: header
+      name: X-Telegram-Bot-Api-Secret-Token
+
+  parameters:
+    GroupId:
+      name: groupId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ExpenseId:
+      name: expenseId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RepaymentId:
+      name: repaymentId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: UUID, генерируется клиентом один раз на действие и повторяется при ретраях.
+      schema: { type: string, format: uuid }
+    IdempotencyKeyOptional:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Необязателен; если передан — работает как в денежных ручках.
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Непрозрачная строка из `next_cursor` предыдущей страницы.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Невалидный JSON или ошибка валидации (`invalid_body`, `validation_failed`)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: validation_failed
+              message: Некорректные данные запроса
+              details: { amount: "Сумма долей не совпадает с суммой расхода" }
+    Unauthorized:
+      description: Нет access-токена, он неверный или истёк (`unauthorized`)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Не участник группы, не owner или не автор записи (`forbidden`)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Не найдено (`not_found`)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    IdempotencyMismatch:
+      description: Тот же `Idempotency-Key` уже использован с другим телом запроса (`idempotency_key_mismatch`)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TooManyRequests:
+      description: Превышен лимит запросов (`rate_limited`)
+      headers:
+        Retry-After:
+          description: Через сколько секунд можно повторить
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Internal:
+      description: Внутренняя ошибка (`internal`); детали — только в логах сервера
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    # ---------- общие ----------
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Стабильный машинный код
+              enum:
+                - invalid_body
+                - validation_failed
+                - invite_expired
+                - unauthorized
+                - invalid_credentials
+                - invalid_refresh_token
+                - forbidden
+                - not_found
+                - email_taken
+                - idempotency_key_mismatch
+                - too_many_participants
+                - rate_limited
+                - internal
+            message: { type: string, description: "Текст для человека" }
+            details:
+              type: object
+              additionalProperties: { type: string }
+              description: Для ошибок валидации — поле → сообщение
+    Amount:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 100000000000
+      description: Сумма в копейках (до 1 млрд ₽)
+      example: 300000
+    UserRef:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: Вася }
+    PageCursor:
+      type: string
+      nullable: true
+      description: "`null` — страниц больше нет"
+
+    # ---------- auth ----------
+    SignUpRequest:
+      type: object
+      required: [email, password, name]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password:
+          type: string
+          minLength: 8
+          maxLength: 72
+          description: 8–72 **байт** в UTF-8 (ограничение bcrypt)
+        name: { type: string, minLength: 1, maxLength: 50 }
+    SignInRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string }
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string, description: "Живёт 30 дней, одноразовый" }
+        token_type: { type: string, enum: [Bearer] }
+        expires_in: { type: integer, description: "Время жизни access-токена в секундах", example: 900 }
+    User:
+      type: object
+      required: [id, email, name, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+
+    # ---------- me ----------
+    Me:
+      allOf:
+        - $ref: "#/components/schemas/User"
+        - type: object
+          required: [telegram_linked]
+          properties:
+            telegram_linked: { type: boolean }
+    UpdateMeRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 50 }
+    TelegramLink:
+      type: object
+      required: [link, expires_at]
+      properties:
+        link: { type: string, example: "https://t.me/SplitPayBot?start=a1b2c3..." }
+        expires_at: { type: string, format: date-time }
+
+    # ---------- groups ----------
+    CreateGroupRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+    GroupRole:
+      type: string
+      enum: [owner, member]
+    GroupSummary:
+      type: object
+      required: [id, name, my_role, members_count, my_balance]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        my_role: { $ref: "#/components/schemas/GroupRole" }
+        members_count: { type: integer }
+        my_balance:
+          type: integer
+          format: int64
+          description: ">0 — мне должны, <0 — я должен (копейки, из проекции)"
+    GroupMember:
+      type: object
+      required: [user_id, name, role, joined_at]
+      properties:
+        user_id: { type: string, format: uuid }
+        name: { type: string }
+        role: { $ref: "#/components/schemas/GroupRole" }
+        joined_at: { type: string, format: date-time }
+    GroupDetails:
+      type: object
+      required: [id, name, created_at, members]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+        members:
+          type: array
+          items: { $ref: "#/components/schemas/GroupMember" }
+    Invite:
+      type: object
+      required: [token, expires_at]
+      properties:
+        token: { type: string, description: "Показывается один раз" }
+        expires_at: { type: string, format: date-time }
+    JoinGroupRequest:
+      type: object
+      required: [token]
+      properties:
+        token: { type: string }
+
+    # ---------- attachments ----------
+    ContentType:
+      type: string
+      enum: [image/jpeg, image/png, application/pdf]
+    CreateUploadUrlRequest:
+      type: object
+      required: [content_type, size_bytes]
+      properties:
+        content_type: { $ref: "#/components/schemas/ContentType" }
+        size_bytes: { type: integer, format: int64, minimum: 1, maximum: 10485760 }
+    UploadUrl:
+      type: object
+      required: [attachment_id, upload_url, method, headers, expires_at]
+      properties:
+        attachment_id: { type: string, format: uuid }
+        upload_url: { type: string }
+        method: { type: string, enum: [PUT] }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          example: { Content-Type: image/jpeg }
+        expires_at: { type: string, format: date-time }
+    Attachment:
+      type: object
+      required: [id, content_type, size_bytes, download_url, download_url_expires_at]
+      properties:
+        id: { type: string, format: uuid }
+        content_type: { $ref: "#/components/schemas/ContentType" }
+        size_bytes: { type: integer, format: int64 }
+        download_url: { type: string, description: "Presigned GET, действует 15 минут" }
+        download_url_expires_at: { type: string, format: date-time }
+
+    # ---------- expenses ----------
+    EqualSplit:
+      type: object
+      required: [type, participant_ids]
+      properties:
+        type: { type: string, enum: [equal] }
+        participant_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string, format: uuid }
+          description: На кого делится расход (участники группы)
+    ExactShare:
+      type: object
+      required: [user_id, amount]
+      properties:
+        user_id: { type: string, format: uuid }
+        amount:
+          type: integer
+          format: int64
+          minimum: 0
+    ExactSplit:
+      type: object
+      required: [type, shares]
+      properties:
+        type: { type: string, enum: [exact] }
+        shares:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/ExactShare" }
+          description: Сумма долей должна совпасть с `amount`; user_id без повторов
+    Split:
+      oneOf:
+        - $ref: "#/components/schemas/EqualSplit"
+        - $ref: "#/components/schemas/ExactSplit"
+      discriminator:
+        propertyName: type
+        mapping:
+          equal: "#/components/schemas/EqualSplit"
+          exact: "#/components/schemas/ExactSplit"
+    CreateExpenseRequest:
+      type: object
+      required: [description, amount, split]
+      properties:
+        description: { type: string, minLength: 1, maxLength: 200, example: Пицца }
+        amount: { $ref: "#/components/schemas/Amount" }
+        payer_id:
+          type: string
+          format: uuid
+          description: Кто заплатил; по умолчанию — текущий пользователь
+        split: { $ref: "#/components/schemas/Split" }
+        attachment_id:
+          type: string
+          format: uuid
+          description: Фото чека из `/attachments/upload-url`
+      example:
+        description: Пицца
+        amount: 300000
+        split:
+          type: equal
+          participant_ids:
+            - 11111111-1111-1111-1111-111111111111
+            - 22222222-2222-2222-2222-222222222222
+            - 33333333-3333-3333-3333-333333333333
+    ExpenseShare:
+      type: object
+      required: [user, amount]
+      properties:
+        user: { $ref: "#/components/schemas/UserRef" }
+        amount: { type: integer, format: int64 }
+    Expense:
+      type: object
+      required: [id, group_id, description, amount, payer, created_by, split_type, shares, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        group_id: { type: string, format: uuid }
+        description: { type: string }
+        amount: { type: integer, format: int64 }
+        payer: { $ref: "#/components/schemas/UserRef" }
+        created_by: { $ref: "#/components/schemas/UserRef" }
+        split_type: { type: string, enum: [equal, exact] }
+        shares:
+          type: array
+          items: { $ref: "#/components/schemas/ExpenseShare" }
+        attachment:
+          allOf:
+            - $ref: "#/components/schemas/Attachment"
+          nullable: true
+        created_at: { type: string, format: date-time }
+    ExpenseListItem:
+      type: object
+      required: [id, description, amount, payer, created_by, has_attachment, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        description: { type: string }
+        amount: { type: integer, format: int64 }
+        payer: { $ref: "#/components/schemas/UserRef" }
+        created_by: { $ref: "#/components/schemas/UserRef" }
+        my_share:
+          type: integer
+          format: int64
+          description: Моя доля; 0 — если я не участвую
+        has_attachment: { type: boolean }
+        created_at: { type: string, format: date-time }
+    ExpensePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/ExpenseListItem" }
+        next_cursor: { $ref: "#/components/schemas/PageCursor" }
+
+    # ---------- repayments ----------
+    CreateRepaymentRequest:
+      type: object
+      required: [from_user_id, to_user_id, amount]
+      properties:
+        from_user_id: { type: string, format: uuid, description: "Кто отдал деньги" }
+        to_user_id: { type: string, format: uuid, description: "Кто получил" }
+        amount: { $ref: "#/components/schemas/Amount" }
+        attachment_id:
+          type: string
+          format: uuid
+          description: Скриншот перевода из `/attachments/upload-url`
+    Repayment:
+      type: object
+      required: [id, group_id, from, to, amount, created_by, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        group_id: { type: string, format: uuid }
+        from: { $ref: "#/components/schemas/UserRef" }
+        to: { $ref: "#/components/schemas/UserRef" }
+        amount: { type: integer, format: int64 }
+        created_by: { $ref: "#/components/schemas/UserRef" }
+        attachment:
+          allOf:
+            - $ref: "#/components/schemas/Attachment"
+          nullable: true
+        created_at: { type: string, format: date-time }
+    RepaymentPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Repayment" }
+        next_cursor: { $ref: "#/components/schemas/PageCursor" }
+
+    # ---------- balances & settlement ----------
+    Balance:
+      type: object
+      required: [user, net]
+      properties:
+        user: { $ref: "#/components/schemas/UserRef" }
+        net:
+          type: integer
+          format: int64
+          description: ">0 — ему должны, <0 — он должен (копейки)"
+    Balances:
+      type: object
+      required: [items, updated_at]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Balance" }
+        updated_at:
+          type: string
+          format: date-time
+          description: Когда проекция последний раз обновлялась
+    Transfer:
+      type: object
+      required: [from, to, amount]
+      properties:
+        from: { $ref: "#/components/schemas/UserRef" }
+        to: { $ref: "#/components/schemas/UserRef" }
+        amount: { type: integer, format: int64 }
+    SettlementPlan:
+      type: object
+      required: [transfers, algorithm, participants, computed_at]
+      properties:
+        transfers:
+          type: array
+          items: { $ref: "#/components/schemas/Transfer" }
+          description: Пустой массив — все в расчёте
+        algorithm:
+          type: string
+          enum: [greedy, exact]
+          description: Какой алгоритм фактически использован
+        participants:
+          type: integer
+          description: Участников с ненулевым балансом (n)
+        computed_at: { type: string, format: date-time }
+
+    # ---------- activity ----------
+    ActivityType:
+      type: string
+      enum: [expense_created, expense_deleted, repayment_created, repayment_deleted, member_joined]
+    ActivityItem:
+      type: object
+      required: [id, type, actor, data, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        type: { $ref: "#/components/schemas/ActivityType" }
+        actor: { $ref: "#/components/schemas/UserRef" }
+        data:
+          type: object
+          additionalProperties: true
+          description: Снимок на момент события (описание, сумма, участники) — зависит от `type`
+          example: { expense_id: "…", description: "Пицца", amount: 300000 }
+        created_at: { type: string, format: date-time }
+    ActivityPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/ActivityItem" }
+        next_cursor: { $ref: "#/components/schemas/PageCursor" }
+
+    # ---------- telegram ----------
+    TelegramUpdate:
+      type: object
+      description: Объект Update из Telegram Bot API (используем только нужные поля)
+      required: [update_id]
+      additionalProperties: true
+      properties:
+        update_id: { type: integer, format: int64 }
+        message:
+          type: object
+          additionalProperties: true
+          properties:
+            text: { type: string, example: "/start a1b2c3..." }
+            chat:
+              type: object
+              additionalProperties: true
+              properties:
+                id: { type: integer, format: int64 }
+
+security:
+  - BearerAuth: []

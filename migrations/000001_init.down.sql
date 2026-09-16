@@ -1,0 +1,21 @@
+DROP TABLE IF EXISTS processed_events;
+DROP TABLE IF EXISTS outbox;
+DROP TABLE IF EXISTS idempotency_keys;
+
+DROP TABLE IF EXISTS activity;
+DROP TABLE IF EXISTS balances;
+
+DROP TABLE IF EXISTS attachments;
+DROP TABLE IF EXISTS repayments;
+DROP TABLE IF EXISTS expense_splits;
+DROP TABLE IF EXISTS expenses;
+
+DROP TABLE IF EXISTS group_invites;
+DROP TABLE IF EXISTS group_members;
+DROP TABLE IF EXISTS groups;
+
+DROP TABLE IF EXISTS telegram_links;
+DROP TABLE IF EXISTS refresh_sessions;
+DROP TABLE IF EXISTS users;
+
+DROP EXTENSION IF EXISTS citext;
