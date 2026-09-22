@@ -95,6 +95,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TokenPair"
+        "400":
+          description: Ошибка запроса (отсутствует токен)
         "401":
           description: Невалидный, просроченный или отозванный refresh-токен
         "500":
@@ -105,7 +107,7 @@ paths:
       tags:
         - Groups
       summary: Создание новой группы
-      description: Создает новую группу для совместных расходов. Текущий авторизованный пользователь автоматически становится ее создателем и участником.
+      description: Создает новую группу для совместных расходов. Текущий авторизованный пользователь автоматически становится ее создателем и владельцем.
       security:
         - BearerAuth: []
       requestBody:
@@ -123,12 +125,125 @@ paths:
                 $ref: "#/components/schemas/GroupResponse"
         "400":
           description: Ошибка валидации тела запроса
+        "401":
+          description: Не авторизован (отсутствует или недействителен Access токен)
+        "500":
+          description: Внутренняя ошибка сервера
+
+    get:
+      tags:
+        - Groups
+      summary: Получение списка групп
+      description: Возвращает список всех групп, в которых состоит текущий авторизованный пользователь.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Успешное получение списка групп
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ValidationErrorResponse"
+                type: array
+                items:
+                  $ref: "#/components/schemas/GroupResponse"
         "401":
-          description: Не авторизован (отсутствует или недействителен Access токен)
+          description: Не авторизован
+        "500":
+          description: Внутренняя ошибка сервера
+
+  /groups/{id}:
+    get:
+      tags:
+        - Groups
+      summary: Получение деталей группы
+      description: Возвращает детальную информацию о группе и список ее участников. Доступно только участникам этой группы.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: UUID группы
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Детали группы успешно получены
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GroupDetailsResponse"
+        "400":
+          description: Неверный формат ID группы
+        "401":
+          description: Не авторизован
+        "403":
+          description: Доступ запрещен (пользователь не является участником группы)
+        "500":
+          description: Внутренняя ошибка сервера
+
+  /groups/{id}/invites:
+    post:
+      tags:
+        - Groups
+      summary: Генерация инвайта в группу
+      description: Создает или обновляет инвайт-токен для группы. Доступно только участникам этой группы.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: UUID группы
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Инвайт успешно сгенерирован
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InviteResponse"
+        "400":
+          description: Неверный формат ID группы
+        "401":
+          description: Не авторизован
+        "403":
+          description: Доступ запрещен (пользователь не является участником группы)
+        "500":
+          description: Внутренняя ошибка сервера
+
+  /groups/join:
+    post:
+      tags:
+        - Groups
+      summary: Вступление в группу
+      description: Добавляет текущего авторизованного пользователя в группу по инвайт-токену.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JoinGroupInput"
+      responses:
+        "200":
+          description: Пользователь успешно присоединился к группе
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "successfully joined the group"
+        "400":
+          description: Инвайт не найден, истек, или неверный формат тела запроса
+        "401":
+          description: Не авторизован
         "500":
           description: Внутренняя ошибка сервера
 
@@ -213,8 +328,8 @@ components:
       required:
         - id
         - name
-        - created_by
-        - created_at
+        - currency
+        - owner_id
       properties:
         id:
           type: string
@@ -223,11 +338,85 @@ components:
         name:
           type: string
           example: "Поездка на Алтай"
-        created_by:
+        currency:
+          type: string
+          example: "RUB"
+        owner_id:
           type: string
           format: uuid
           example: "123e4567-e89b-12d3-a456-426614174001"
-        created_at:
+
+    GroupMemberInfo:
+      type: object
+      required:
+        - id
+        - email
+        - role
+        - joined_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "123e4567-e89b-12d3-a456-426614174001"
+        email:
+          type: string
+          format: email
+          example: "member@example.com"
+        role:
+          type: string
+          example: "owner"
+        joined_at:
           type: string
           format: date-time
-          example: "2026-09-21T16:48:48Z"
+          example: "2026-09-22T10:00:00Z"
+
+    GroupDetailsResponse:
+      type: object
+      required:
+        - id
+        - name
+        - currency
+        - owner_id
+        - members
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        name:
+          type: string
+          example: "Поездка на Алтай"
+        currency:
+          type: string
+          example: "RUB"
+        owner_id:
+          type: string
+          format: uuid
+          example: "123e4567-e89b-12d3-a456-426614174001"
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/GroupMemberInfo"
+
+    InviteResponse:
+      type: object
+      required:
+        - invite_link
+        - expires_at
+      properties:
+        invite_link:
+          type: string
+          example: "e88d752f-1234-4068-98e3-53e34b99865a"
+        expires_at:
+          type: string
+          format: date-time
+          example: "2026-09-23T10:00:00Z"
+
+    JoinGroupInput:
+      type: object
+      required:
+        - token
+      properties:
+        token:
+          type: string
+          example: "e88d752f-1234-4068-98e3-53e34b99865a"

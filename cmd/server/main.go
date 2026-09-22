@@ -40,12 +40,17 @@ func main() {
 	fmt.Println("Successfully connected to PostgreSQL!")
 
 	authRepo := postgres.NewAuthPostgres(pool)
+	groupRepo := postgres.NewGroupRepository(pool)
+
 	authService := service.NewAuthService(authRepo, cfg.JWTSecret)
+	groupService := service.NewGroupService(groupRepo)
+
 	authHandler := v1.NewAuthHandler(authService)
+	groupHandler := v1.NewGroupHandler(groupService)
 
-	_ = middleware.NewAuthMiddleware(cfg.JWTSecret)
+	authMW := middleware.NewAuthMiddleware(cfg.JWTSecret)
+	requireGroupAccess := middleware.RequireGroupAccess(groupRepo)
 
-	// ============================
 
 	mux := http.NewServeMux()
 
@@ -53,6 +58,14 @@ func main() {
 	mux.HandleFunc("POST /api/v1/auth/sign-in", authHandler.SignIn)
 	mux.HandleFunc("POST /api/v1/auth/refresh", authHandler.Refresh)
 
+	// Защищенные роуты (Только авторизованные пользователи)
+	mux.HandleFunc("POST /api/v1/groups", authMW.RequireAuth(groupHandler.CreateGroup))
+	mux.HandleFunc("GET /api/v1/groups", authMW.RequireAuth(groupHandler.GetUserGroups))
+	mux.HandleFunc("POST /api/v1/groups/join", authMW.RequireAuth(groupHandler.JoinGroup))
+
+	// Защищенные роуты (Авторизация + Доступ к конкретной группе)
+	mux.HandleFunc("GET /api/v1/groups/{id}", authMW.RequireAuth(requireGroupAccess(groupHandler.GetGroupDetails)))
+	mux.HandleFunc("POST /api/v1/groups/{id}/invites", authMW.RequireAuth(requireGroupAccess(groupHandler.GenerateInvite)))
 
 
 	srv := &http.Server{
@@ -70,7 +83,6 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-
 
 	fmt.Println("\nGracefully shutting down server...")
 

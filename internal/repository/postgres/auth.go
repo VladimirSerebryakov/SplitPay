@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"splitpay/internal/domain"
 
@@ -31,7 +32,7 @@ func (r *AuthPostgres) CreateUser(ctx context.Context, user *domain.User) error 
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return errors.New("user with this email already exists")
 		}
-		return err
+		return fmt.Errorf("failed to create user: %w", err)
 	}
 	return nil
 }
@@ -48,7 +49,8 @@ func (r *AuthPostgres) GetUserByEmail(ctx context.Context, email string) (*domai
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.New("invalid email or password")
 		}
-		return nil, err
+		// Оборачиваем техническую ошибку
+		return nil, fmt.Errorf("failed to get user by email: %w", err)
 	}
 	return &user, nil
 }
@@ -59,7 +61,11 @@ func (r *AuthPostgres) CreateRefreshSession(ctx context.Context, session *domain
 		VALUES ($1, $2, $3)
 		RETURNING id`
 
-	return r.pool.QueryRow(ctx, query, session.UserID, session.TokenHash, session.ExpiresAt).Scan(&session.ID)
+	err := r.pool.QueryRow(ctx, query, session.UserID, session.TokenHash, session.ExpiresAt).Scan(&session.ID)
+	if err != nil {
+		return fmt.Errorf("failed to create refresh session: %w", err)
+	}
+	return nil
 }
 
 func (r *AuthPostgres) GetRefreshSession(ctx context.Context, token string) (*domain.RefreshSession, error) {
@@ -74,7 +80,7 @@ func (r *AuthPostgres) GetRefreshSession(ctx context.Context, token string) (*do
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.New("session not found")
 		}
-		return nil, err
+		return nil, fmt.Errorf("failed to get refresh session: %w", err)
 	}
 
 	return &session, nil
@@ -84,5 +90,8 @@ func (r *AuthPostgres) DeleteRefreshSession(ctx context.Context, token string) e
 	query := `DELETE FROM refresh_sessions WHERE token_hash = $1`
 
 	_, err := r.pool.Exec(ctx, query, token)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to delete refresh session: %w", err)
+	}
+	return nil
 }
