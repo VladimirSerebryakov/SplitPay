@@ -1,0 +1,233 @@
+openapi: 3.0.3
+info:
+  title: SplitPay API
+  version: 1.0.0
+  description: API сервиса совместного учета расходов и долгов в группах.
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Локальный сервер разработки
+
+tags:
+  - name: Auth
+    description: Эндпоинты аутентификации и управления сессиями
+  - name: Groups
+    description: Управление группами пользователей
+
+paths:
+  /auth/sign-up:
+    post:
+      tags:
+        - Auth
+      summary: Регистрация нового пользователя
+      description: Создает нового пользователя в системе и возвращает пустой ответ в случае успеха.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignUpInput"
+      responses:
+        "201":
+          description: Пользователь успешно создан (Created)
+        "400":
+          description: Ошибка валидации (неверный формат email или короткий пароль)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
+        "409":
+          description: Конфликт (пользователь с таким email уже существует)
+        "500":
+          description: Внутренняя ошибка сервера
+
+  /auth/sign-in:
+    post:
+      tags:
+        - Auth
+      summary: Вход в систему (Логин)
+      description: Аутентификация по email и паролю. Возвращает пару access и refresh токенов.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignInInput"
+      responses:
+        "200":
+          description: Успешный вход
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "400":
+          description: Ошибка валидации запроса
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
+        "401":
+          description: Неверный email или пароль (Unauthorized)
+        "500":
+          description: Внутренняя ошибка сервера
+
+  /auth/refresh:
+    post:
+      tags:
+        - Auth
+      summary: Обновление Access-токена
+      description: Принимает действующий refresh-токен и возвращает новую пару токенов.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - refresh_token
+              properties:
+                refresh_token:
+                  type: string
+                  example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+      responses:
+        "200":
+          description: Токены успешно обновлены
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "401":
+          description: Невалидный, просроченный или отозванный refresh-токен
+        "500":
+          description: Внутренняя ошибка сервера
+
+  /groups:
+    post:
+      tags:
+        - Groups
+      summary: Создание новой группы
+      description: Создает новую группу для совместных расходов. Текущий авторизованный пользователь автоматически становится ее создателем и участником.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateGroupInput"
+      responses:
+        "201":
+          description: Группа успешно создана
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GroupResponse"
+        "400":
+          description: Ошибка валидации тела запроса
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
+        "401":
+          description: Не авторизован (отсутствует или недействителен Access токен)
+        "500":
+          description: Внутренняя ошибка сервера
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    ValidationErrorResponse:
+      type: object
+      properties:
+        errors:
+          type: object
+          additionalProperties:
+            type: string
+          example:
+            email: "Неверный формат email адреса"
+            password: "Это поле обязательно для заполнения"
+
+    SignUpInput:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          example: "user@example.com"
+        password:
+          type: string
+          format: password
+          minLength: 6
+          example: "secret123"
+
+    SignInInput:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          example: "user@example.com"
+        password:
+          type: string
+          format: password
+          example: "secret123"
+
+    TokenPair:
+      type: object
+      required:
+        - access_token
+        - refresh_token
+      properties:
+        access_token:
+          type: string
+          description: JWT Access Token
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI..."
+        refresh_token:
+          type: string
+          description: Refresh Token
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+    CreateGroupInput:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          example: "Поездка на Алтай"
+
+    GroupResponse:
+      type: object
+      required:
+        - id
+        - name
+        - created_by
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        name:
+          type: string
+          example: "Поездка на Алтай"
+        created_by:
+          type: string
+          format: uuid
+          example: "123e4567-e89b-12d3-a456-426614174001"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-09-21T16:48:48Z"
