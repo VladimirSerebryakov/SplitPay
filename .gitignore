@@ -5,4 +5,6 @@ bin/
 *.so
 *.dylib
 .env
+docs/
 .vscode/
+CLAUDE.md

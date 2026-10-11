@@ -12,6 +12,8 @@ tags:
     description: Эндпоинты аутентификации и управления сессиями
   - name: Groups
     description: Управление группами пользователей
+  - name: Expenses & Balances
+    description: Добавление чеков, возвраты долгов и расчет баланса
 
 paths:
   /auth/sign-up:
@@ -123,18 +125,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GroupResponse"
-        "400":
-          description: Ошибка валидации тела запроса
         "401":
-          description: Не авторизован (отсутствует или недействителен Access токен)
+          description: Не авторизован
         "500":
           description: Внутренняя ошибка сервера
-
     get:
       tags:
         - Groups
       summary: Получение списка групп
-      description: Возвращает список всех групп, в которых состоит текущий авторизованный пользователь.
       security:
         - BearerAuth: []
       responses:
@@ -156,14 +154,12 @@ paths:
       tags:
         - Groups
       summary: Получение деталей группы
-      description: Возвращает детальную информацию о группе и список ее участников. Доступно только участникам этой группы.
       security:
         - BearerAuth: []
       parameters:
         - name: id
           in: path
           required: true
-          description: UUID группы
           schema:
             type: string
             format: uuid
@@ -174,28 +170,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GroupDetailsResponse"
-        "400":
-          description: Неверный формат ID группы
-        "401":
-          description: Не авторизован
         "403":
-          description: Доступ запрещен (пользователь не является участником группы)
-        "500":
-          description: Внутренняя ошибка сервера
+          description: Доступ запрещен
 
   /groups/{id}/invites:
     post:
       tags:
         - Groups
       summary: Генерация инвайта в группу
-      description: Создает или обновляет инвайт-токен для группы. Доступно только участникам этой группы.
       security:
         - BearerAuth: []
       parameters:
         - name: id
           in: path
           required: true
-          description: UUID группы
           schema:
             type: string
             format: uuid
@@ -206,21 +194,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/InviteResponse"
-        "400":
-          description: Неверный формат ID группы
-        "401":
-          description: Не авторизован
         "403":
-          description: Доступ запрещен (пользователь не является участником группы)
-        "500":
-          description: Внутренняя ошибка сервера
+          description: Доступ запрещен
 
   /groups/join:
     post:
       tags:
         - Groups
       summary: Вступление в группу
-      description: Добавляет текущего авторизованного пользователя в группу по инвайт-токену.
       security:
         - BearerAuth: []
       requestBody:
@@ -231,21 +212,160 @@ paths:
               $ref: "#/components/schemas/JoinGroupInput"
       responses:
         "200":
-          description: Пользователь успешно присоединился к группе
+          description: Пользователь успешно присоединился
+
+  # --- НОВЫЕ ЭНДПОИНТЫ ДЛЯ РАСХОДОВ ---
+  /groups/{id}/expenses:
+    post:
+      tags:
+        - Expenses & Balances
+      summary: Добавление нового чека (расхода)
+      description: Фиксирует трату, указывая, кто платил и за кого (сплиты).
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: UUID группы
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateExpenseInput"
+      responses:
+        "201":
+          description: Чек успешно добавлен
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  message:
-                    type: string
-                    example: "successfully joined the group"
+                $ref: "#/components/schemas/ExpenseResponse"
         "400":
-          description: Инвайт не найден, истек, или неверный формат тела запроса
-        "401":
-          description: Не авторизован
+          description: Ошибка валидации (сумма сплитов не сходится с общей суммой)
+        "403":
+          description: Пользователь не в группе
         "500":
           description: Внутренняя ошибка сервера
+
+  /groups/{id}/expenses/{expense_id}:
+    delete:
+      tags:
+        - Expenses & Balances
+      summary: Удаление чека
+      description: Полностью удаляет чек и связанные с ним долги.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: expense_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Чек успешно удален (No Content)
+        "403":
+          description: Пользователь не в группе или не имеет прав на удаление
+        "404":
+          description: Чек не найден
+
+  /groups/{id}/repayments:
+    post:
+      tags:
+        - Expenses & Balances
+      summary: Возврат долга (Settle up)
+      description: Фиксирует факт возврата денег от должника к кредитору.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateRepaymentInput"
+      responses:
+        "201":
+          description: Возврат успешно зафиксирован
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepaymentResponse"
+        "400":
+          description: Ошибка валидации
+        "403":
+          description: Пользователь не в группе
+
+  /groups/{id}/balances:
+    get:
+      tags:
+        - Expenses & Balances
+      summary: Получение балансов группы
+      description: Возвращает сводку для всех участников (в плюсе или в минусе).
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Массив балансов
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/UserBalanceResponse"
+        "403":
+          description: Доступ запрещен
+
+  /groups/{id}/transactions:
+    get:
+      tags:
+        - Expenses & Balances
+      summary: История операций (Лента)
+      description: Возвращает хронологический список всех чеков и возвратов в группе, отсортированный по убыванию даты.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Успешное получение истории
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TransactionResponse"
+        "403":
+          description: Доступ запрещен
 
 components:
   securitySchemes:
@@ -325,74 +445,30 @@ components:
 
     GroupResponse:
       type: object
-      required:
-        - id
-        - name
-        - currency
-        - owner_id
+      required: [id, name, currency, owner_id]
       properties:
-        id:
-          type: string
-          format: uuid
-          example: "550e8400-e29b-41d4-a716-446655440000"
-        name:
-          type: string
-          example: "Поездка на Алтай"
-        currency:
-          type: string
-          example: "RUB"
-        owner_id:
-          type: string
-          format: uuid
-          example: "123e4567-e89b-12d3-a456-426614174001"
+        id: { type: string, format: uuid }
+        name: { type: string }
+        currency: { type: string, example: "RUB" }
+        owner_id: { type: string, format: uuid }
 
     GroupMemberInfo:
       type: object
-      required:
-        - id
-        - email
-        - role
-        - joined_at
+      required: [id, email, role, joined_at]
       properties:
-        id:
-          type: string
-          format: uuid
-          example: "123e4567-e89b-12d3-a456-426614174001"
-        email:
-          type: string
-          format: email
-          example: "member@example.com"
-        role:
-          type: string
-          example: "owner"
-        joined_at:
-          type: string
-          format: date-time
-          example: "2026-09-22T10:00:00Z"
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        role: { type: string, example: "owner" }
+        joined_at: { type: string, format: date-time }
 
     GroupDetailsResponse:
       type: object
-      required:
-        - id
-        - name
-        - currency
-        - owner_id
-        - members
+      required: [id, name, currency, owner_id, members]
       properties:
-        id:
-          type: string
-          format: uuid
-          example: "550e8400-e29b-41d4-a716-446655440000"
-        name:
-          type: string
-          example: "Поездка на Алтай"
-        currency:
-          type: string
-          example: "RUB"
-        owner_id:
-          type: string
-          format: uuid
-          example: "123e4567-e89b-12d3-a456-426614174001"
+        id: { type: string, format: uuid }
+        name: { type: string }
+        currency: { type: string }
+        owner_id: { type: string, format: uuid }
         members:
           type: array
           items:
@@ -400,23 +476,157 @@ components:
 
     InviteResponse:
       type: object
-      required:
-        - invite_link
-        - expires_at
+      required: [invite_link, expires_at]
       properties:
-        invite_link:
-          type: string
-          example: "e88d752f-1234-4068-98e3-53e34b99865a"
-        expires_at:
-          type: string
-          format: date-time
-          example: "2026-09-23T10:00:00Z"
+        invite_link: { type: string, example: "e88d752f-1234-4068-98e3-53e34b99865a" }
+        expires_at: { type: string, format: date-time }
 
     JoinGroupInput:
       type: object
-      required:
-        - token
+      required: [token]
       properties:
-        token:
+        token: { type: string, example: "e88d752f-1234-4068-98e3-53e34b99865a" }
+
+    ExpenseSplitInput:
+      type: object
+      required: [user_id, amount]
+      properties:
+        user_id:
           type: string
-          example: "e88d752f-1234-4068-98e3-53e34b99865a"
+          format: uuid
+          description: ID участника, за которого заплатили
+        amount:
+          type: number
+          format: float
+          description: Сумма, которую должен этот участник
+          example: 500.50
+
+    CreateExpenseInput:
+      type: object
+      required: [description, payer_id, total_amount, splits]
+      properties:
+        description:
+          type: string
+          example: "Ужин в хинкальной"
+        payer_id:
+          type: string
+          format: uuid
+          description: Кто фактически оплатил чек
+        total_amount:
+          type: number
+          format: float
+          example: 1500.00
+        splits:
+          type: array
+          description: Как распределяется долг
+          items:
+            $ref: "#/components/schemas/ExpenseSplitInput"
+
+    ExpenseResponse:
+      type: object
+      required: [id, group_id, description, payer_id, total_amount, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        group_id: { type: string, format: uuid }
+        description: { type: string }
+        payer_id: { type: string, format: uuid }
+        total_amount: { type: number, format: float }
+        created_at: { type: string, format: date-time }
+
+    CreateRepaymentInput:
+      type: object
+      required: [from_user_id, to_user_id, amount]
+      properties:
+        from_user_id:
+          type: string
+          format: uuid
+          description: Кто возвращает долг
+        to_user_id:
+          type: string
+          format: uuid
+          description: Кому возвращают долг
+        amount:
+          type: number
+          format: float
+          example: 500.00
+
+    RepaymentResponse:
+      type: object
+      required: [id, group_id, from_user_id, to_user_id, amount, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        group_id: { type: string, format: uuid }
+        from_user_id: { type: string, format: uuid }
+        to_user_id: { type: string, format: uuid }
+        amount: { type: number, format: float }
+        created_at: { type: string, format: date-time }
+
+    UserBalanceResponse:
+      type: object
+      required: [user_id, balance]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        balance:
+          type: number
+          format: float
+          description: "Положительный - пользователю должны. Отрицательный - пользователь должен."
+          example: -500.50
+
+    ExpenseSplitResponse:
+      type: object
+      required: [user_id, amount]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        amount:
+          type: number
+          format: float
+          description: Сумма долга участника по этому чеку
+
+    TransactionResponse:
+      type: object
+      required: [id, type, amount, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [expense, repayment]
+          description: "Тип транзакции: чек (expense) или возврат долга (repayment)"
+        amount:
+          type: number
+          format: float
+          description: Общая сумма чека или сумма возврата
+        created_at:
+          type: string
+          format: date-time
+        # --- Поля для type = expense ---
+        description:
+          type: string
+          nullable: true
+          description: "Название чека (только для expense)"
+        payer_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: "Кто оплатил чек (только для expense)"
+        splits:
+          type: array
+          nullable: true
+          description: "Разбивка долгов по чеку (только для expense)"
+          items:
+            $ref: "#/components/schemas/ExpenseSplitResponse"
+        from_user_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: "Кто возвращает деньги (только для repayment)"
+        to_user_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: "Кому возвращают деньги (только для repayment)"
