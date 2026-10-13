@@ -62,7 +62,7 @@ func (r *GroupRepository) GetGroupByID(ctx context.Context, groupID uuid.UUID) (
 	err := r.db.QueryRow(ctx, query, groupID).Scan(&g.ID, &g.Name, &g.Currency, &g.OwnerID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("group not found")
+			return nil, domain.ErrNotFound
 		}
 		return nil, fmt.Errorf("failed to get group by id: %w", err)
 	}
@@ -90,6 +90,9 @@ func (r *GroupRepository) GetUserGroups(ctx context.Context, userID uuid.UUID) (
 		}
 		groups = append(groups, g)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate groups: %w", err)
+	}
 	return groups, nil
 }
 
@@ -113,6 +116,9 @@ func (r *GroupRepository) GetGroupMembers(ctx context.Context, groupID uuid.UUID
 			return nil, fmt.Errorf("failed to scan member: %w", err)
 		}
 		members = append(members, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate group members: %w", err)
 	}
 	return members, nil
 }

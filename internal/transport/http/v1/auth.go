@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"splitpay/internal/domain"
 
@@ -16,7 +17,7 @@ type AuthService interface {
 }
 
 type AuthHandler struct {
-	service AuthService
+	service  AuthService
 	validate *validator.Validate
 }
 
@@ -43,11 +44,10 @@ func (h *AuthHandler) SignUp(w http.ResponseWriter, r *http.Request) {
 
 	err := h.service.SignUp(r.Context(), input)
 	if err != nil {
-		if err.Error() == "user with this email already exists" {
-			http.Error(w, err.Error(), http.StatusConflict) // 409
+		if errors.Is(err, domain.ErrEmailTaken) {
+			http.Error(w, domain.ErrEmailTaken.Error(), http.StatusConflict) // 409
 			return
 		}
-
 		http.Error(w, "internal server error", http.StatusInternalServerError) // 500
 		return
 	}
@@ -71,8 +71,8 @@ func (h *AuthHandler) SignIn(w http.ResponseWriter, r *http.Request) {
 
 	tokens, err := h.service.SignIn(r.Context(), input)
 	if err != nil {
-		if err.Error() == "invalid email or password" {
-			http.Error(w, err.Error(), http.StatusUnauthorized) // 401
+		if errors.Is(err, domain.ErrInvalidCredentials) {
+			http.Error(w, domain.ErrInvalidCredentials.Error(), http.StatusUnauthorized) // 401
 			return
 		}
 
@@ -103,7 +103,11 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 
 	tokens, err := h.service.RefreshTokens(r.Context(), input.RefreshToken)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
+		if errors.Is(err, domain.ErrInvalidRefreshToken) {
+			http.Error(w, domain.ErrInvalidRefreshToken.Error(), http.StatusUnauthorized)
+			return
+		}
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 

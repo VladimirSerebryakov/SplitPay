@@ -30,7 +30,7 @@ func (r *AuthPostgres) CreateUser(ctx context.Context, user *domain.User) error 
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			return errors.New("user with this email already exists")
+			return domain.ErrAlreadyExists
 		}
 		return fmt.Errorf("failed to create user: %w", err)
 	}
@@ -47,9 +47,8 @@ func (r *AuthPostgres) GetUserByEmail(ctx context.Context, email string) (*domai
 	err := r.pool.QueryRow(ctx, query, email).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, errors.New("invalid email or password")
+			return nil, domain.ErrNotFound
 		}
-		// Оборачиваем техническую ошибку
 		return nil, fmt.Errorf("failed to get user by email: %w", err)
 	}
 	return &user, nil
@@ -78,7 +77,7 @@ func (r *AuthPostgres) GetRefreshSession(ctx context.Context, token string) (*do
 	err := r.pool.QueryRow(ctx, query, token).Scan(&session.ID, &session.UserID, &session.TokenHash, &session.ExpiresAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, errors.New("session not found")
+			return nil, domain.ErrNotFound
 		}
 		return nil, fmt.Errorf("failed to get refresh session: %w", err)
 	}
@@ -89,9 +88,12 @@ func (r *AuthPostgres) GetRefreshSession(ctx context.Context, token string) (*do
 func (r *AuthPostgres) DeleteRefreshSession(ctx context.Context, token string) error {
 	query := `DELETE FROM refresh_sessions WHERE token_hash = $1`
 
-	_, err := r.pool.Exec(ctx, query, token)
+	tag, err := r.pool.Exec(ctx, query, token)
 	if err != nil {
 		return fmt.Errorf("failed to delete refresh session: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
 	}
 	return nil
 }

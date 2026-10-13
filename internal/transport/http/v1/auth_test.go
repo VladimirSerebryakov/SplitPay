@@ -58,7 +58,7 @@ func TestAuthHandler_SignUp(t *testing.T) {
 		{
 			name:         "User Already Exists",
 			requestBody:  `{"email": "test@test.com", "password": "password123"}`,
-			mockError:    errors.New("user with this email already exists"),
+			mockError:    domain.ErrEmailTaken,
 			expectedCode: http.StatusConflict,
 		},
 		{
@@ -122,7 +122,7 @@ func TestAuthHandler_SignIn(t *testing.T) {
 			name:           "Invalid Credentials",
 			requestBody:    `{"email": "test@test.com", "password": "wrong"}`,
 			mockTokens:     domain.TokenPair{},
-			mockError:      errors.New("invalid email or password"),
+			mockError:      domain.ErrInvalidCredentials,
 			expectedCode:   http.StatusUnauthorized,
 			expectingToken: false,
 		},
@@ -168,32 +168,32 @@ func TestAuthHandler_Refresh(t *testing.T) {
 	}
 
 	tests := []struct {
-		name           string
-		requestBody    string
-		mockTokens     domain.TokenPair
-		mockError      error
-		expectedCode   int
+		name         string
+		requestBody  string
+		mockTokens   domain.TokenPair
+		mockError    error
+		expectedCode int
 	}{
 		{
-			name:           "Success",
-			requestBody:    `{"refresh_token": "old.refresh.token"}`,
-			mockTokens:     expectedTokens,
-			mockError:      nil,
-			expectedCode:   http.StatusOK,
+			name:         "Success",
+			requestBody:  `{"refresh_token": "old.refresh.token"}`,
+			mockTokens:   expectedTokens,
+			mockError:    nil,
+			expectedCode: http.StatusOK,
 		},
 		{
-			name:           "Empty Token",
-			requestBody:    `{"refresh_token": ""}`,
-			mockTokens:     domain.TokenPair{},
-			mockError:      nil,
-			expectedCode:   http.StatusBadRequest,
+			name:         "Empty Token",
+			requestBody:  `{"refresh_token": ""}`,
+			mockTokens:   domain.TokenPair{},
+			mockError:    nil,
+			expectedCode: http.StatusBadRequest,
 		},
 		{
-			name:           "Expired or Invalid Token",
-			requestBody:    `{"refresh_token": "expired.token"}`,
-			mockTokens:     domain.TokenPair{},
-			mockError:      errors.New("refresh token expired"),
-			expectedCode:   http.StatusUnauthorized,
+			name:         "Expired or Invalid Token",
+			requestBody:  `{"refresh_token": "expired.token"}`,
+			mockTokens:   domain.TokenPair{},
+			mockError:    domain.ErrInvalidRefreshToken,
+			expectedCode: http.StatusUnauthorized,
 		},
 	}
 

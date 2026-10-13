@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"splitpay/internal/domain"
@@ -40,7 +41,7 @@ func NewAuthService(repo AuthRepository, jwtSecret string) *AuthService {
 func (s *AuthService) SignUp(ctx context.Context, input domain.SignUpInput) error {
 	hash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to hash password: %w", err)
 	}
 
 	user := &domain.User{
@@ -48,23 +49,32 @@ func (s *AuthService) SignUp(ctx context.Context, input domain.SignUpInput) erro
 		PasswordHash: string(hash),
 	}
 
-	return s.repo.CreateUser(ctx, user)
+	if err := s.repo.CreateUser(ctx, user); err != nil {
+		if errors.Is(err, domain.ErrAlreadyExists) {
+			return domain.ErrEmailTaken
+		}
+		return fmt.Errorf("repo.CreateUser: %w", err)
+	}
+	return nil
 }
 
 func (s *AuthService) SignIn(ctx context.Context, input domain.SignInInput) (domain.TokenPair, error) {
 	user, err := s.repo.GetUserByEmail(ctx, input.Email)
 	if err != nil {
-		return domain.TokenPair{}, err
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.TokenPair{}, domain.ErrInvalidCredentials
+		}
+		return domain.TokenPair{}, fmt.Errorf("repo.GetUserByEmail: %w", err)
 	}
 
 	err = bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(input.Password))
 	if err != nil {
-		return domain.TokenPair{}, errors.New("invalid email or password")
+		return domain.TokenPair{}, domain.ErrInvalidCredentials
 	}
 
 	accessToken, err := s.generateAccessToken(user.ID)
 	if err != nil {
-		return domain.TokenPair{}, err
+		return domain.TokenPair{}, fmt.Errorf("failed to generate access token: %w", err)
 	}
 
 	refreshToken := uuid.New().String()
@@ -75,7 +85,7 @@ func (s *AuthService) SignIn(ctx context.Context, input domain.SignInInput) (dom
 	}
 
 	if err := s.repo.CreateRefreshSession(ctx, session); err != nil {
-		return domain.TokenPair{}, err
+		return domain.TokenPair{}, fmt.Errorf("repo.CreateRefreshSession: %w", err)
 	}
 
 	return domain.TokenPair{
@@ -93,25 +103,34 @@ func (s *AuthService) generateAccessToken(userID uuid.UUID) (string, error) {
 	return token.SignedString([]byte(s.jwtSecret))
 }
 
-
 func (s *AuthService) RefreshTokens(ctx context.Context, refreshToken string) (domain.TokenPair, error) {
 	session, err := s.repo.GetRefreshSession(ctx, refreshToken)
 	if err != nil {
-		return domain.TokenPair{}, errors.New("invalid refresh token")
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.TokenPair{}, domain.ErrInvalidRefreshToken
+		}
+		return domain.TokenPair{}, fmt.Errorf("repo.GetRefreshSession: %w", err)
 	}
 
 	if session.ExpiresAt.Before(time.Now()) {
-		_ = s.repo.DeleteRefreshSession(ctx, refreshToken)
-		return domain.TokenPair{}, errors.New("refresh token expired")
+		if err := s.repo.DeleteRefreshSession(ctx, refreshToken); err != nil {
+			if !errors.Is(err, domain.ErrNotFound) {
+				return domain.TokenPair{}, fmt.Errorf("repo.DeleteRefreshSession: %w", err)
+			}
+		}
+		return domain.TokenPair{}, domain.ErrInvalidRefreshToken
 	}
 
 	if err := s.repo.DeleteRefreshSession(ctx, refreshToken); err != nil {
-		return domain.TokenPair{}, err
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.TokenPair{}, domain.ErrInvalidRefreshToken
+		}
+		return domain.TokenPair{}, fmt.Errorf("repo.DeleteRefreshSession: %w", err)
 	}
 
 	accessToken, err := s.generateAccessToken(session.UserID)
 	if err != nil {
-		return domain.TokenPair{}, err
+		return domain.TokenPair{}, fmt.Errorf("failed to generate access token: %w", err)
 	}
 
 	newRefreshToken := uuid.New().String()
@@ -122,7 +141,7 @@ func (s *AuthService) RefreshTokens(ctx context.Context, refreshToken string) (d
 	}
 
 	if err := s.repo.CreateRefreshSession(ctx, newSession); err != nil {
-		return domain.TokenPair{}, err
+		return domain.TokenPair{}, fmt.Errorf("repo.CreateRefreshSession: %w", err)
 	}
 
 	return domain.TokenPair{

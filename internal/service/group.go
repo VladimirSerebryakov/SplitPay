@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -94,7 +93,7 @@ func (s *GroupService) GenerateInvite(ctx context.Context, groupID, userID uuid.
 		return domain.InviteResponse{}, fmt.Errorf("repo.IsUserInGroup: %w", err)
 	}
 	if !isInGroup {
-		return domain.InviteResponse{}, errors.New("user is not a member of the group")
+		return domain.InviteResponse{}, domain.ErrForbidden
 	}
 
 	token := uuid.New().String()
@@ -117,7 +116,7 @@ func (s *GroupService) JoinByInvite(ctx context.Context, token string, userID uu
 	}
 
 	if time.Now().After(invite.ExpiresAt) {
-		return errors.New("invite token has expired")
+		return domain.ErrInviteExpired
 	}
 
 	if err := s.repo.AddUserToGroup(ctx, invite.GroupID, userID); err != nil {

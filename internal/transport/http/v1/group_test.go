@@ -219,7 +219,7 @@ func TestGroupHandler_GetGroupDetails(t *testing.T) {
 					return domain.GroupDetailsResponse{}, domain.ErrNotFound
 				}
 			},
-			expectedStatus: http.StatusInternalServerError, // Можно поменять на 404, если реализована обработка ErrNotFound в хендлере
+			expectedStatus: http.StatusNotFound,
 		},
 	}
 
@@ -274,10 +274,10 @@ func TestGroupHandler_GenerateInvite(t *testing.T) {
 			pathID: validGroupID.String(),
 			mockBehavior: func(m *mockGroupService) {
 				m.GenerateInviteFunc = func(ctx context.Context, groupID, userID uuid.UUID) (domain.InviteResponse, error) {
-					return domain.InviteResponse{}, errors.New("user is not a member of the group")
+					return domain.InviteResponse{}, domain.ErrForbidden
 				}
 			},
-			expectedStatus: http.StatusInternalServerError,
+			expectedStatus: http.StatusForbidden,
 		},
 	}
 
@@ -326,7 +326,7 @@ func TestGroupHandler_JoinGroup(t *testing.T) {
 			inputBody: domain.JoinGroupInput{Token: "expired-token"},
 			mockBehavior: func(m *mockGroupService) {
 				m.JoinByInviteFunc = func(ctx context.Context, token string, userID uuid.UUID) error {
-					return errors.New("invite token has expired") // Должно обрабатываться как 400 Bad Request
+					return domain.ErrInviteExpired
 				}
 			},
 			expectedStatus: http.StatusBadRequest,

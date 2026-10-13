@@ -51,7 +51,7 @@ func (h *GroupHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.service.CreateGroup(r.Context(), input, userID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -76,7 +76,7 @@ func (h *GroupHandler) GetUserGroups(w http.ResponseWriter, r *http.Request) {
 
 	groups, err := h.service.GetUserGroups(r.Context(), userID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -95,7 +95,11 @@ func (h *GroupHandler) GetGroupDetails(w http.ResponseWriter, r *http.Request) {
 
 	details, err := h.service.GetGroupDetails(r.Context(), groupID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if errors.Is(err, domain.ErrNotFound) {
+			http.Error(w, domain.ErrNotFound.Error(), http.StatusNotFound)
+			return
+		}
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -126,7 +130,11 @@ func (h *GroupHandler) GenerateInvite(w http.ResponseWriter, r *http.Request) {
 
 	inviteResp, err := h.service.GenerateInvite(r.Context(), groupID, userID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if errors.Is(err, domain.ErrForbidden) {
+			http.Error(w, domain.ErrForbidden.Error(), http.StatusForbidden)
+			return
+		}
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -156,11 +164,15 @@ func (h *GroupHandler) JoinGroup(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	if err := h.service.JoinByInvite(r.Context(), input.Token, userID); err != nil {
-		if errors.Is(err, domain.ErrNotFound) || err.Error() == "invite token has expired" {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if errors.Is(err, domain.ErrNotFound) {
+			http.Error(w, domain.ErrNotFound.Error(), http.StatusBadRequest)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if errors.Is(err, domain.ErrInviteExpired) {
+			http.Error(w, domain.ErrInviteExpired.Error(), http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
