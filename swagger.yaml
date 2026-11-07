@@ -12,7 +12,9 @@ info:
     - Защищённые ручки требуют `Authorization: Bearer <access_token>`.
     - Ручки `/groups/{groupId}/...` доступны только участникам группы (иначе `403 forbidden`).
     - Изменяющие ручки с деньгами требуют заголовок `Idempotency-Key` (UUID, один на действие пользователя,
-      тот же при повторах). Повтор с тем же ключом вернёт сохранённый ответ; тот же ключ с другим телом — `422`.
+      тот же при повторах). Ключ привязан к пользователю. Повтор с тем же ключом, HTTP-методом, фактическим
+      путём (включая идентификаторы) и байтами тела вернёт сохранённый ответ. Тот же ключ с другим методом,
+      путём или телом — `422 idempotency_key_mismatch`, в том числе при ответе из кэша.
     - Списки используют keyset-пагинацию: `limit` + `cursor`, в ответе `next_cursor` (`null` — страниц больше нет).
     - Все ошибки — в едином формате `Error` (см. схемы).
 servers:
@@ -676,7 +678,10 @@ components:
       name: Idempotency-Key
       in: header
       required: true
-      description: UUID, генерируется клиентом один раз на действие и повторяется при ретраях.
+      description: |
+        UUID, генерируется клиентом один раз на действие и повторяется при ретраях.
+        В пределах пользователя ключ связан с HTTP-методом, фактическим путём и байтами тела запроса.
+        Изменение любого из них при том же ключе → `422 idempotency_key_mismatch`.
       schema: { type: string, format: uuid }
     IdempotencyKeyOptional:
       name: Idempotency-Key
@@ -723,7 +728,7 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
     IdempotencyMismatch:
-      description: Тот же `Idempotency-Key` уже использован с другим телом запроса (`idempotency_key_mismatch`)
+      description: Тот же `Idempotency-Key` пользователя уже использован с другим HTTP-методом, путём или телом запроса (`idempotency_key_mismatch`)
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }

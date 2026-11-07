@@ -6,4 +6,5 @@ bin/
 *.dylib
 .env
 .vscode/
+AGENTS.md
 CLAUDE.md

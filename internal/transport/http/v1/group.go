@@ -3,12 +3,12 @@ package v1
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"strings"
 
 	"splitpay/internal/domain"
 	"splitpay/internal/transport/http/middleware"
+	"splitpay/internal/transport/http/response"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
@@ -23,31 +23,31 @@ type GroupService interface {
 }
 
 type GroupHandler struct {
-	service GroupService
+	service  GroupService
 	validate *validator.Validate
 }
 
 func NewGroupHandler(service GroupService) *GroupHandler {
-	return &GroupHandler{service: service, validate: validator.New(),}
+	return &GroupHandler{service: service, validate: newValidator()}
 }
 
 // POST /api/v1/groups
 func (h *GroupHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 	userIDStr, err := middleware.GetUserID(r.Context())
 	if err != nil {
-		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
+		response.WriteError(w, r, domain.ErrUnauthorized)
 		return
 	}
 
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
-		http.Error(w, "unauthorized: invalid user id format", http.StatusUnauthorized)
+		response.WriteError(w, r, domain.ErrUnauthorized)
 		return
 	}
 
 	var input domain.CreateGroupInput
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		response.WriteError(w, r, domain.ErrInvalidBody)
 		return
 	}
 	defer r.Body.Close()
@@ -55,13 +55,13 @@ func (h *GroupHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 	input.Name = strings.TrimSpace(input.Name)
 
 	if err := h.validate.Struct(input); err != nil {
-    	HandleValidationErrors(w, err)
-    	return
+		response.WriteError(w, r, validationError(err))
+		return
 	}
 
 	resp, err := h.service.CreateGroup(r.Context(), input, userID)
 	if err != nil {
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		response.WriteError(w, r, err)
 		return
 	}
 
@@ -74,19 +74,19 @@ func (h *GroupHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 func (h *GroupHandler) GetUserGroups(w http.ResponseWriter, r *http.Request) {
 	userIDStr, err := middleware.GetUserID(r.Context())
 	if err != nil {
-		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
+		response.WriteError(w, r, domain.ErrUnauthorized)
 		return
 	}
 
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
-		http.Error(w, "unauthorized: invalid user id format", http.StatusUnauthorized)
+		response.WriteError(w, r, domain.ErrUnauthorized)
 		return
 	}
 
 	groups, err := h.service.GetUserGroups(r.Context(), userID)
 	if err != nil {
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		response.WriteError(w, r, err)
 		return
 	}
 
@@ -99,17 +99,15 @@ func (h *GroupHandler) GetGroupDetails(w http.ResponseWriter, r *http.Request) {
 	groupIDStr := r.PathValue("id")
 	groupID, err := uuid.Parse(groupIDStr)
 	if err != nil {
-		http.Error(w, "invalid group id", http.StatusBadRequest)
+		response.WriteError(w, r, &domain.ValidationError{Fields: map[string]string{
+			"groupId": "Неверный формат UUID группы",
+		}})
 		return
 	}
 
 	details, err := h.service.GetGroupDetails(r.Context(), groupID)
 	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			http.Error(w, domain.ErrNotFound.Error(), http.StatusNotFound)
-			return
-		}
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		response.WriteError(w, r, err)
 		return
 	}
 
@@ -121,30 +119,28 @@ func (h *GroupHandler) GetGroupDetails(w http.ResponseWriter, r *http.Request) {
 func (h *GroupHandler) GenerateInvite(w http.ResponseWriter, r *http.Request) {
 	userIDStr, err := middleware.GetUserID(r.Context())
 	if err != nil {
-		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
+		response.WriteError(w, r, domain.ErrUnauthorized)
 		return
 	}
 
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
-		http.Error(w, "unauthorized: invalid user id format", http.StatusUnauthorized)
+		response.WriteError(w, r, domain.ErrUnauthorized)
 		return
 	}
 
 	groupIDStr := r.PathValue("id")
 	groupID, err := uuid.Parse(groupIDStr)
 	if err != nil {
-		http.Error(w, "invalid group id", http.StatusBadRequest)
+		response.WriteError(w, r, &domain.ValidationError{Fields: map[string]string{
+			"groupId": "Неверный формат UUID группы",
+		}})
 		return
 	}
 
 	inviteResp, err := h.service.GenerateInvite(r.Context(), groupID, userID)
 	if err != nil {
-		if errors.Is(err, domain.ErrForbidden) {
-			http.Error(w, domain.ErrForbidden.Error(), http.StatusForbidden)
-			return
-		}
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		response.WriteError(w, r, err)
 		return
 	}
 
@@ -156,38 +152,30 @@ func (h *GroupHandler) GenerateInvite(w http.ResponseWriter, r *http.Request) {
 func (h *GroupHandler) JoinGroup(w http.ResponseWriter, r *http.Request) {
 	userIDStr, err := middleware.GetUserID(r.Context())
 	if err != nil {
-		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
+		response.WriteError(w, r, domain.ErrUnauthorized)
 		return
 	}
 
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
-		http.Error(w, "unauthorized: invalid user id format", http.StatusUnauthorized)
+		response.WriteError(w, r, domain.ErrUnauthorized)
 		return
 	}
 
 	var input domain.JoinGroupInput
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		response.WriteError(w, r, domain.ErrInvalidBody)
 		return
 	}
 	defer r.Body.Close()
 
 	if err := h.validate.Struct(input); err != nil {
-    	HandleValidationErrors(w, err)
-    	return
+		response.WriteError(w, r, validationError(err))
+		return
 	}
 
 	if err := h.service.JoinByInvite(r.Context(), input.Token, userID); err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			http.Error(w, domain.ErrNotFound.Error(), http.StatusBadRequest)
-			return
-		}
-		if errors.Is(err, domain.ErrInviteExpired) {
-			http.Error(w, domain.ErrInviteExpired.Error(), http.StatusBadRequest)
-			return
-		}
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		response.WriteError(w, r, err)
 		return
 	}
 

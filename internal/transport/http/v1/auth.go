@@ -3,15 +3,16 @@ package v1
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
+
 	"splitpay/internal/domain"
+	"splitpay/internal/transport/http/response"
 
 	"github.com/go-playground/validator/v10"
 )
 
 type AuthService interface {
-	SignUp(ctx context.Context, input domain.SignUpInput) error
+	SignUp(ctx context.Context, input domain.SignUpInput) (*domain.User, error)
 	SignIn(ctx context.Context, input domain.SignInInput) (domain.TokenPair, error)
 	RefreshTokens(ctx context.Context, refreshToken string) (domain.TokenPair, error)
 }
@@ -24,7 +25,7 @@ type AuthHandler struct {
 func NewAuthHandler(service AuthService) *AuthHandler {
 	return &AuthHandler{
 		service:  service,
-		validate: validator.New(),
+		validate: newValidator(),
 	}
 }
 
@@ -32,51 +33,39 @@ func (h *AuthHandler) SignUp(w http.ResponseWriter, r *http.Request) {
 	var input domain.SignUpInput
 
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		http.Error(w, "invalid request body format", http.StatusBadRequest)
+		response.WriteError(w, r, domain.ErrInvalidBody)
 		return
 	}
 	defer r.Body.Close()
 
-	if err := h.validate.Struct(input); err != nil {
-		HandleValidationErrors(w, err)
-		return
-	}
-
-	err := h.service.SignUp(r.Context(), input)
+	user, err := h.service.SignUp(r.Context(), input)
 	if err != nil {
-		if errors.Is(err, domain.ErrEmailTaken) {
-			http.Error(w, domain.ErrEmailTaken.Error(), http.StatusConflict) // 409
-			return
-		}
-		http.Error(w, "internal server error", http.StatusInternalServerError) // 500
+		response.WriteError(w, r, err)
 		return
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated) // 201
+	json.NewEncoder(w).Encode(user)
 }
 
 func (h *AuthHandler) SignIn(w http.ResponseWriter, r *http.Request) {
 	var input domain.SignInInput
 
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		http.Error(w, "invalid request body format", http.StatusBadRequest)
+		response.WriteError(w, r, domain.ErrInvalidBody)
 		return
 	}
 	defer r.Body.Close()
 
 	if err := h.validate.Struct(input); err != nil {
-		HandleValidationErrors(w, err)
+		response.WriteError(w, r, validationError(err))
 		return
 	}
 
 	tokens, err := h.service.SignIn(r.Context(), input)
 	if err != nil {
-		if errors.Is(err, domain.ErrInvalidCredentials) {
-			http.Error(w, domain.ErrInvalidCredentials.Error(), http.StatusUnauthorized) // 401
-			return
-		}
-
-		http.Error(w, "internal server error", http.StatusInternalServerError) // 500
+		response.WriteError(w, r, err)
 		return
 	}
 
@@ -91,23 +80,21 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		http.Error(w, "invalid request body format", http.StatusBadRequest)
+		response.WriteError(w, r, domain.ErrInvalidBody)
 		return
 	}
 	defer r.Body.Close()
 
 	if input.RefreshToken == "" {
-		http.Error(w, "refresh_token is required", http.StatusBadRequest)
+		response.WriteError(w, r, &domain.ValidationError{Fields: map[string]string{
+			"refresh_token": "Это поле обязательно для заполнения",
+		}})
 		return
 	}
 
 	tokens, err := h.service.RefreshTokens(r.Context(), input.RefreshToken)
 	if err != nil {
-		if errors.Is(err, domain.ErrInvalidRefreshToken) {
-			http.Error(w, domain.ErrInvalidRefreshToken.Error(), http.StatusUnauthorized)
-			return
-		}
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		response.WriteError(w, r, err)
 		return
 	}
 

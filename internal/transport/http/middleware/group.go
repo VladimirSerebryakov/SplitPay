@@ -4,6 +4,9 @@ import (
 	"context"
 	"net/http"
 
+	"splitpay/internal/domain"
+	"splitpay/internal/transport/http/response"
+
 	"github.com/google/uuid"
 )
 
@@ -16,31 +19,33 @@ func RequireGroupAccess(checker GroupAccessChecker) func(http.HandlerFunc) http.
 		return func(w http.ResponseWriter, r *http.Request) {
 			userIDStr, err := GetUserID(r.Context())
 			if err != nil {
-				http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
+				response.WriteError(w, r, domain.ErrUnauthorized)
 				return
 			}
 
 			userID, err := uuid.Parse(userIDStr)
 			if err != nil {
-				http.Error(w, "unauthorized: invalid user id format", http.StatusUnauthorized)
+				response.WriteError(w, r, domain.ErrUnauthorized)
 				return
 			}
 
 			groupIDStr := r.PathValue("id")
 			groupID, err := uuid.Parse(groupIDStr)
 			if err != nil {
-				http.Error(w, "bad request: invalid group id format", http.StatusBadRequest)
+				response.WriteError(w, r, &domain.ValidationError{Fields: map[string]string{
+					"groupId": "Неверный формат UUID группы",
+				}})
 				return
 			}
 
 			hasAccess, err := checker.IsUserInGroup(r.Context(), groupID, userID)
 			if err != nil {
-				http.Error(w, "internal server error", http.StatusInternalServerError)
+				response.WriteError(w, r, err)
 				return
 			}
 
 			if !hasAccess {
-				http.Error(w, "forbidden: you are not a member of this group", http.StatusForbidden)
+				response.WriteError(w, r, domain.ErrForbidden)
 				return
 			}
 

@@ -13,8 +13,9 @@ import (
 	"splitpay/internal/config"
 	"splitpay/internal/repository/postgres"
 	"splitpay/internal/service"
-	"splitpay/internal/transport/http/v1"
+	httptransport "splitpay/internal/transport/http"
 	"splitpay/internal/transport/http/middleware"
+	"splitpay/internal/transport/http/v1"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -49,28 +50,11 @@ func main() {
 	groupHandler := v1.NewGroupHandler(groupService)
 
 	authMW := middleware.NewAuthMiddleware(cfg.JWTSecret)
-	requireGroupAccess := middleware.RequireGroupAccess(groupRepo)
-
-
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("POST /api/v1/auth/sign-up", authHandler.SignUp)
-	mux.HandleFunc("POST /api/v1/auth/sign-in", authHandler.SignIn)
-	mux.HandleFunc("POST /api/v1/auth/refresh", authHandler.Refresh)
-
-	// Защищенные роуты (Только авторизованные пользователи)
-	mux.HandleFunc("POST /api/v1/groups", authMW.RequireAuth(groupHandler.CreateGroup))
-	mux.HandleFunc("GET /api/v1/groups", authMW.RequireAuth(groupHandler.GetUserGroups))
-	mux.HandleFunc("POST /api/v1/groups/join", authMW.RequireAuth(groupHandler.JoinGroup))
-
-	// Защищенные роуты (Авторизация + Доступ к конкретной группе)
-	mux.HandleFunc("GET /api/v1/groups/{id}", authMW.RequireAuth(requireGroupAccess(groupHandler.GetGroupDetails)))
-	mux.HandleFunc("POST /api/v1/groups/{id}/invites", authMW.RequireAuth(requireGroupAccess(groupHandler.GenerateInvite)))
-
+	router := httptransport.NewRouter(authHandler, groupHandler, authMW, groupRepo)
 
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,
-		Handler: mux,
+		Handler: router,
 	}
 
 	go func() {

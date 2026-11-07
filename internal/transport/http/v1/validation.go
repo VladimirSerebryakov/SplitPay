@@ -1,34 +1,39 @@
 package v1
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
+	"reflect"
 	"strings"
+
+	"splitpay/internal/domain"
 
 	"github.com/go-playground/validator/v10"
 )
 
-type ValidationErrorResponse struct {
-	Errors map[string]string `json:"errors"`
+func newValidator() *validator.Validate {
+	validate := validator.New()
+	validate.RegisterTagNameFunc(func(field reflect.StructField) string {
+		name := strings.SplitN(field.Tag.Get("json"), ",", 2)[0]
+		if name == "-" {
+			return ""
+		}
+		return name
+	})
+	return validate
 }
 
-func HandleValidationErrors(w http.ResponseWriter, err error) {
+func validationError(err error) error {
 	var validationErrs validator.ValidationErrors
 
 	if errors.As(err, &validationErrs) {
 		errs := make(map[string]string)
 		for _, f := range validationErrs {
-			field := strings.ToLower(f.Field())
-			errs[field] = getErrorMsg(f)
+			errs[f.Field()] = getErrorMsg(f)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ValidationErrorResponse{Errors: errs})
-		return
+		return &domain.ValidationError{Fields: errs}
 	}
-	http.Error(w, "invalid request body", http.StatusBadRequest)
+	return err
 }
 
 func getErrorMsg(f validator.FieldError) string {

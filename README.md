@@ -53,19 +53,30 @@ make run                      # запустить сервер на :8080
 ## Структура проекта
 
 ```
-cmd/server/main.go               точка входа: конфиг, DI, роуты, graceful shutdown
+cmd/api/main.go                  точка входа API: конфиг, DI, graceful shutdown
+cmd/{relay,*-worker,janitor}/      каталоги будущих фоновых процессов
 internal/
   config/                        загрузка конфигурации из env / .env
   domain/                        модели, DTO запросов/ответов, доменные ошибки
   service/                       бизнес-логика; интерфейсы репозиториев объявлены здесь
   repository/postgres/           работа с БД (pgx)
   transport/http/
+    router.go                    регистрация маршрутов
     middleware/                  RequireAuth (JWT), RequireGroupAccess (членство в группе)
     v1/                          HTTP-хендлеры, валидация
+  transport/kafka/               будущая работа с Kafka
+  events/                        будущие контракты событий
+  worker/{balance,activity,notification}/  будущие обработчики событий
+  relay/, janitor/               будущие циклы публикации и очистки
+  settlement/                    будущие алгоритмы расчёта долгов
+  token/, redis/, s3/, telegram/  будущие операции с токенами и интеграциями
 migrations/                      SQL-миграции (up/down)
 tests/integration/               интеграционные тесты с testcontainers
+deploy/nginx/                    каталог будущей конфигурации reverse proxy
 swagger.yaml                     спецификация API (OpenAPI)
 ```
+
+Принятая структура и границы пакетов описаны в [Design.md](docs/Design.md#структура-проекта). Сейчас реализован только прототип API; `.gitkeep` в остальных каталогах сохраняет место для будущего кода.
 
 ## API
 

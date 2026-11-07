@@ -1,20 +1,23 @@
 package v1
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
 
 	"splitpay/internal/domain"
 )
 
-// === 1. Mock для AuthService ===
-
 type mockAuthService struct {
+	signUpUser    *domain.User
 	signUpErr     error
 	signInTokens  domain.TokenPair
 	signInErr     error
@@ -22,197 +25,138 @@ type mockAuthService struct {
 	refreshErr    error
 }
 
-func (m *mockAuthService) SignUp(ctx context.Context, input domain.SignUpInput) error {
-	return m.signUpErr
+func (m *mockAuthService) SignUp(context.Context, domain.SignUpInput) (*domain.User, error) {
+	return m.signUpUser, m.signUpErr
 }
 
-func (m *mockAuthService) SignIn(ctx context.Context, input domain.SignInInput) (domain.TokenPair, error) {
+func (m *mockAuthService) SignIn(context.Context, domain.SignInInput) (domain.TokenPair, error) {
 	return m.signInTokens, m.signInErr
 }
 
-func (m *mockAuthService) RefreshTokens(ctx context.Context, refreshToken string) (domain.TokenPair, error) {
+func (m *mockAuthService) RefreshTokens(context.Context, string) (domain.TokenPair, error) {
 	return m.refreshTokens, m.refreshErr
 }
 
-// === 2. Тесты для SignUp ===
-
 func TestAuthHandler_SignUp(t *testing.T) {
-	tests := []struct {
-		name         string
-		requestBody  string
-		mockError    error
-		expectedCode int
-	}{
-		{
-			name:         "Success",
-			requestBody:  `{"email": "test@test.com", "password": "password123"}`,
-			mockError:    nil,
-			expectedCode: http.StatusCreated,
-		},
-		{
-			name:         "Invalid JSON",
-			requestBody:  `{"email": "test@test.com", "pass`,
-			mockError:    nil,
-			expectedCode: http.StatusBadRequest,
-		},
-		{
-			name:         "User Already Exists",
-			requestBody:  `{"email": "test@test.com", "password": "password123"}`,
-			mockError:    domain.ErrEmailTaken,
-			expectedCode: http.StatusConflict,
-		},
-		{
-			name:         "Internal Server Error",
-			requestBody:  `{"email": "test@test.com", "password": "password123"}`,
-			mockError:    errors.New("db error"),
-			expectedCode: http.StatusInternalServerError,
-		},
+	user := &domain.User{
+		ID: uuid.New(), Name: "Иван", Email: "ivan@example.com",
+		CreatedAt:    time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC),
+		PasswordHash: "секретный хеш",
 	}
-
-	for _, tc := range tests {
+	const validBody = `{"name":"Иван","email":"ivan@example.com","password":"password123"}`
+	for _, tc := range []struct {
+		name, body  string
+		err         error
+		status      int
+		code, field string
+	}{
+		{"успех", validBody, nil, 201, "", ""},
+		{"неверный JSON", `{`, nil, 400, "invalid_body", ""},
+		{"нет имени", `{"email":"ivan@example.com","password":"password123"}`,
+			&domain.ValidationError{Fields: map[string]string{"name": "Имя обязательно"}}, 400, "validation_failed", "name"},
+		{"неверный email", `{"name":"Иван","email":"wrong","password":"password123"}`,
+			&domain.ValidationError{Fields: map[string]string{"email": "Неверный формат email адреса"}}, 400, "validation_failed", "email"},
+		{"email занят", validBody, fmt.Errorf("регистрация: %w", domain.ErrEmailTaken), 409, "email_taken", ""},
+		{"сбой сервиса", validBody, errors.New("секретная причина сбоя хранилища"), 500, "internal", ""},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			mockService := &mockAuthService{signUpErr: tc.mockError}
-			handler := NewAuthHandler(mockService)
-
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/sign-up", bytes.NewBufferString(tc.requestBody))
-			recorder := httptest.NewRecorder()
-
-			handler.SignUp(recorder, req)
-
-			if recorder.Code != tc.expectedCode {
-				t.Errorf("expected status %d, got %d", tc.expectedCode, recorder.Code)
+			handler := NewAuthHandler(&mockAuthService{signUpUser: user, signUpErr: tc.err})
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/sign-up", strings.NewReader(tc.body))
+			handler.SignUp(rr, req)
+			if tc.code != "" {
+				checkErrorResponse(t, rr, tc.status, tc.code, tc.field)
+				return
+			}
+			if rr.Code != 201 || rr.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("Ожидался JSON с кодом 201, получено: %d %s", rr.Code, rr.Body.String())
+			}
+			var result domain.User
+			if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.ID != user.ID || result.Name != user.Name || result.Email != user.Email || !result.CreatedAt.Equal(user.CreatedAt) {
+				t.Fatalf("Неверные данные пользователя: %s", rr.Body.String())
+			}
+			if strings.Contains(rr.Body.String(), "password_hash") || strings.Contains(rr.Body.String(), user.PasswordHash) {
+				t.Fatal("Хеш пароля попал в ответ")
 			}
 		})
 	}
 }
-
-// === 3. Тесты для SignIn ===
 
 func TestAuthHandler_SignIn(t *testing.T) {
-	expectedTokens := domain.TokenPair{
-		AccessToken:  "valid.access.token",
-		RefreshToken: "valid.refresh.token",
-	}
-
-	tests := []struct {
-		name           string
-		requestBody    string
-		mockTokens     domain.TokenPair
-		mockError      error
-		expectedCode   int
-		expectingToken bool
+	tokens := domain.TokenPair{AccessToken: "access", RefreshToken: "refresh"}
+	for _, tc := range []struct {
+		name, body  string
+		err         error
+		status      int
+		code, field string
 	}{
-		{
-			name:           "Success",
-			requestBody:    `{"email": "test@test.com", "password": "password123"}`,
-			mockTokens:     expectedTokens,
-			mockError:      nil,
-			expectedCode:   http.StatusOK,
-			expectingToken: true,
-		},
-		{
-			name:           "Invalid JSON",
-			requestBody:    `not-a-json`,
-			mockTokens:     domain.TokenPair{},
-			mockError:      nil,
-			expectedCode:   http.StatusBadRequest,
-			expectingToken: false,
-		},
-		{
-			name:           "Invalid Credentials",
-			requestBody:    `{"email": "test@test.com", "password": "wrong"}`,
-			mockTokens:     domain.TokenPair{},
-			mockError:      domain.ErrInvalidCredentials,
-			expectedCode:   http.StatusUnauthorized,
-			expectingToken: false,
-		},
-	}
-
-	for _, tc := range tests {
+		{"успех", `{"email":"ivan@example.com","password":"password123"}`, nil, 200, "", ""},
+		{"неверный JSON", `[]`, nil, 400, "invalid_body", ""},
+		{"пустые поля", `{}`, nil, 400, "validation_failed", "email"},
+		{"неверный пароль", `{"email":"ivan@example.com","password":"wrong"}`,
+			fmt.Errorf("вход: %w", domain.ErrInvalidCredentials), 401, "invalid_credentials", ""},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			mockService := &mockAuthService{
-				signInTokens: tc.mockTokens,
-				signInErr:    tc.mockError,
+			handler := NewAuthHandler(&mockAuthService{signInTokens: tokens, signInErr: tc.err})
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/sign-in", strings.NewReader(tc.body))
+			handler.SignIn(rr, req)
+			if tc.code != "" {
+				checkErrorResponse(t, rr, tc.status, tc.code, tc.field)
+				return
 			}
-			handler := NewAuthHandler(mockService)
-
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/sign-in", bytes.NewBufferString(tc.requestBody))
-			recorder := httptest.NewRecorder()
-
-			handler.SignIn(recorder, req)
-
-			if recorder.Code != tc.expectedCode {
-				t.Errorf("expected status %d, got %d", tc.expectedCode, recorder.Code)
+			var result domain.TokenPair
+			if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
 			}
-
-			if tc.expectingToken {
-				var responseTokens domain.TokenPair
-				err := json.NewDecoder(recorder.Body).Decode(&responseTokens)
-				if err != nil {
-					t.Fatalf("failed to decode response JSON: %v", err)
-				}
-				if responseTokens.AccessToken != tc.mockTokens.AccessToken {
-					t.Errorf("expected access token %s, got %s", tc.mockTokens.AccessToken, responseTokens.AccessToken)
-				}
+			if rr.Code != 200 || result != tokens {
+				t.Fatalf("Неверный ответ: %d %s", rr.Code, rr.Body.String())
 			}
 		})
 	}
 }
 
-// === 4. Тесты для Refresh ===
-
 func TestAuthHandler_Refresh(t *testing.T) {
-	expectedTokens := domain.TokenPair{
-		AccessToken:  "new.access.token",
-		RefreshToken: "new.refresh.token",
-	}
-
-	tests := []struct {
-		name         string
-		requestBody  string
-		mockTokens   domain.TokenPair
-		mockError    error
-		expectedCode int
+	tokens := domain.TokenPair{AccessToken: "new-access", RefreshToken: "new-refresh"}
+	for _, tc := range []struct {
+		name, body  string
+		err         error
+		status      int
+		code, field string
 	}{
-		{
-			name:         "Success",
-			requestBody:  `{"refresh_token": "old.refresh.token"}`,
-			mockTokens:   expectedTokens,
-			mockError:    nil,
-			expectedCode: http.StatusOK,
-		},
-		{
-			name:         "Empty Token",
-			requestBody:  `{"refresh_token": ""}`,
-			mockTokens:   domain.TokenPair{},
-			mockError:    nil,
-			expectedCode: http.StatusBadRequest,
-		},
-		{
-			name:         "Expired or Invalid Token",
-			requestBody:  `{"refresh_token": "expired.token"}`,
-			mockTokens:   domain.TokenPair{},
-			mockError:    domain.ErrInvalidRefreshToken,
-			expectedCode: http.StatusUnauthorized,
-		},
-	}
-
-	for _, tc := range tests {
+		{"успех", `{"refresh_token":"old-refresh"}`, nil, 200, "", ""},
+		{"неверный JSON", `{`, nil, 400, "invalid_body", ""},
+		{"пустой токен", `{"refresh_token":""}`, nil, 400, "validation_failed", "refresh_token"},
+		{"неверный токен", `{"refresh_token":"wrong"}`,
+			fmt.Errorf("refresh: %w", domain.ErrInvalidRefreshToken), 401, "invalid_refresh_token", ""},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			mockService := &mockAuthService{
-				refreshTokens: tc.mockTokens,
-				refreshErr:    tc.mockError,
+			handler := NewAuthHandler(&mockAuthService{refreshTokens: tokens, refreshErr: tc.err})
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", strings.NewReader(tc.body))
+			handler.Refresh(rr, req)
+			if tc.code != "" {
+				checkErrorResponse(t, rr, tc.status, tc.code, tc.field)
+				return
 			}
-			handler := NewAuthHandler(mockService)
-
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", bytes.NewBufferString(tc.requestBody))
-			recorder := httptest.NewRecorder()
-
-			handler.Refresh(recorder, req)
-
-			if recorder.Code != tc.expectedCode {
-				t.Errorf("expected status %d, got %d", tc.expectedCode, recorder.Code)
+			var result domain.TokenPair
+			if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if rr.Code != 200 || result != tokens {
+				t.Fatalf("Неверный ответ: %d %s", rr.Code, rr.Body.String())
 			}
 		})
 	}
+}
+
+func TestAuthHandlerBodyTooLarge(t *testing.T) {
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/sign-up", strings.NewReader(`{"name":"Иван","email":"ivan@example.com","password":"password123"}`))
+	req.Body = http.MaxBytesReader(rr, req.Body, 8)
+	NewAuthHandler(&mockAuthService{}).SignUp(rr, req)
+	checkErrorResponse(t, rr, 400, "invalid_body", "")
 }

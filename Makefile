@@ -3,7 +3,7 @@ include .env
 .PHONY: db-up db-down migrate-create migrate-up migrate-down
 
 run:
-	go run cmd/server/main.go
+	go run ./cmd/api
 
 db-up:
 	docker compose up -d
