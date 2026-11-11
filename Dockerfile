@@ -5,14 +5,19 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY . .
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
 RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/api ./cmd/api
 
-FROM alpine:latest
+FROM alpine:3
 
 WORKDIR /app
 
-COPY --from=builder /app/bin/api /app/api
+RUN adduser -D -u 10001 app
+
+COPY --from=builder --chown=app:app /app/bin/api /app/api
+
+USER app
 
 EXPOSE 8080
 

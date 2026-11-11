@@ -15,6 +15,7 @@ type AuthService interface {
 	SignUp(ctx context.Context, input domain.SignUpInput) (*domain.User, error)
 	SignIn(ctx context.Context, input domain.SignInInput) (domain.TokenPair, error)
 	RefreshTokens(ctx context.Context, refreshToken string) (domain.TokenPair, error)
+	Logout(ctx context.Context, refreshToken string) error
 }
 
 type AuthHandler struct {
@@ -101,4 +102,29 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(tokens)
+}
+
+func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		RefreshToken string `json:"refresh_token" validate:"required"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		response.WriteError(w, r, domain.ErrInvalidBody)
+		return
+	}
+	defer r.Body.Close()
+
+	if err := h.validate.Struct(input); err != nil {
+		response.WriteError(w, r, validationError(err))
+		return
+	}
+
+	err := h.service.Logout(r.Context(), input.RefreshToken)
+	if err != nil {
+		response.WriteError(w, r, err)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }

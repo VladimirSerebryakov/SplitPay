@@ -61,6 +61,12 @@ func (m *mockGroupService) JoinByInvite(ctx context.Context, token string, userI
 	return nil
 }
 
+type groupAccessStub struct{}
+
+func (groupAccessStub) IsUserInGroup(context.Context, uuid.UUID, uuid.UUID) (bool, error) {
+	return true, nil
+}
+
 // === Тесты ===
 
 func TestGroupHandler_CreateGroup(t *testing.T) {
@@ -198,20 +204,15 @@ func TestGroupHandler_GetGroupDetails(t *testing.T) {
 			pathID: validGroupID.String(),
 			mockBehavior: func(m *mockGroupService) {
 				m.GetGroupDetailsFunc = func(ctx context.Context, groupID uuid.UUID) (domain.GroupDetailsResponse, error) {
+					if groupID != validGroupID {
+						t.Fatalf("В сервис передан неверный UUID группы: %v", groupID)
+					}
 					return domain.GroupDetailsResponse{
 						ID: groupID, Name: "Detailed Group", Currency: "RUB", OwnerID: testUserID,
 					}, nil
 				}
 			},
 			expectedStatus: http.StatusOK,
-		},
-		{
-			name:   "Invalid UUID Format",
-			pathID: "invalid-uuid",
-			mockBehavior: func(m *mockGroupService) {
-				// Метод не должен вызываться
-			},
-			expectedStatus: http.StatusBadRequest,
 		},
 		{
 			name:   "Not Found / Service Error",
@@ -232,14 +233,13 @@ func TestGroupHandler_GetGroupDetails(t *testing.T) {
 			handler := NewGroupHandler(mockService)
 
 			req := httptest.NewRequest(http.MethodGet, "/api/v1/groups/"+tt.pathID, nil)
-			// Go 1.22+ позволяет внедрять PathValue напрямую в реквест для тестов
-			req.SetPathValue("id", tt.pathID)
+			req.SetPathValue("groupId", tt.pathID)
 
 			ctx := context.WithValue(req.Context(), middleware.UserIDKey, testUserID.String())
 			req = req.WithContext(ctx)
 
 			rr := httptest.NewRecorder()
-			handler.GetGroupDetails(rr, req)
+			middleware.RequireGroupAccess(groupAccessStub{})(handler.GetGroupDetails)(rr, req)
 
 			if rr.Code != tt.expectedStatus {
 				t.Errorf("expected status %d, got %d. Body: %s", tt.expectedStatus, rr.Code, rr.Body.String())
@@ -263,6 +263,9 @@ func TestGroupHandler_GenerateInvite(t *testing.T) {
 			pathID: validGroupID.String(),
 			mockBehavior: func(m *mockGroupService) {
 				m.GenerateInviteFunc = func(ctx context.Context, groupID, userID uuid.UUID) (domain.InviteResponse, error) {
+					if groupID != validGroupID || userID != testUserID {
+						t.Fatalf("В сервис переданы неверные UUID: группа=%v, пользователь=%v", groupID, userID)
+					}
 					return domain.InviteResponse{
 						InviteLink: "invite-token-123",
 						ExpiresAt:  time.Now().Add(24 * time.Hour),
@@ -290,12 +293,12 @@ func TestGroupHandler_GenerateInvite(t *testing.T) {
 			handler := NewGroupHandler(mockService)
 
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/groups/"+tt.pathID+"/invites", nil)
-			req.SetPathValue("id", tt.pathID)
+			req.SetPathValue("groupId", tt.pathID)
 			ctx := context.WithValue(req.Context(), middleware.UserIDKey, testUserID.String())
 			req = req.WithContext(ctx)
 
 			rr := httptest.NewRecorder()
-			handler.GenerateInvite(rr, req)
+			middleware.RequireGroupAccess(groupAccessStub{})(handler.GenerateInvite)(rr, req)
 
 			if rr.Code != tt.expectedStatus {
 				t.Errorf("expected status %d, got %d", tt.expectedStatus, rr.Code)
@@ -404,18 +407,20 @@ func TestGroupHandlerErrorResponses(t *testing.T) {
 		{"join token", group.JoinGroup, `{}`, "", 400, "validation_failed", "token"},
 		{"create failure", group.CreateGroup, `{"name":"Поездка"}`, "", 500, "internal", ""},
 		{"list failure", group.GetUserGroups, "", "", 500, "internal", ""},
-		{"group UUID", group.GetGroupDetails, "", "wrong", 400, "validation_failed", "groupId"},
-		{"invite UUID", group.GenerateInvite, "", "wrong", 400, "validation_failed", "groupId"},
 		{"group missing", group.GetGroupDetails, "", uuid.NewString(), 404, "not_found", ""},
 		{"invite forbidden", group.GenerateInvite, "", uuid.NewString(), 403, "forbidden", ""},
 		{"invite missing", group.JoinGroup, `{"token":"wrong"}`, "", 404, "not_found", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/groups", strings.NewReader(tc.body))
-			req.SetPathValue("id", tc.groupID)
+			req.SetPathValue("groupId", tc.groupID)
 			req = req.WithContext(context.WithValue(req.Context(), middleware.UserIDKey, uuid.NewString()))
 			rr := httptest.NewRecorder()
-			tc.handler(rr, req)
+			next := tc.handler
+			if tc.groupID != "" {
+				next = middleware.RequireGroupAccess(groupAccessStub{})(next)
+			}
+			next(rr, req)
 			checkErrorResponse(t, rr, tc.status, tc.code, tc.field)
 		})
 	}
@@ -426,7 +431,7 @@ func TestGroupHandlersRequireUser(t *testing.T) {
 	for _, invalidID := range []string{"", "wrong"} {
 		for _, next := range []http.HandlerFunc{handler.CreateGroup, handler.GetUserGroups, handler.GenerateInvite, handler.JoinGroup} {
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/groups", nil)
-			req.SetPathValue("id", uuid.NewString())
+			req.SetPathValue("groupId", uuid.NewString())
 			if invalidID != "" {
 				req = req.WithContext(context.WithValue(req.Context(), middleware.UserIDKey, invalidID))
 			}
@@ -434,5 +439,38 @@ func TestGroupHandlersRequireUser(t *testing.T) {
 			next(rr, req)
 			checkErrorResponse(t, rr, 401, "unauthorized", "")
 		}
+	}
+}
+
+func TestGroupHandlersRequireGroupContext(t *testing.T) {
+	called := false
+	handler := NewGroupHandler(&mockGroupService{
+		GetGroupDetailsFunc: func(context.Context, uuid.UUID) (domain.GroupDetailsResponse, error) {
+			called = true
+			return domain.GroupDetailsResponse{}, nil
+		},
+		GenerateInviteFunc: func(context.Context, uuid.UUID, uuid.UUID) (domain.InviteResponse, error) {
+			called = true
+			return domain.InviteResponse{}, nil
+		},
+	})
+	for _, tc := range []struct {
+		name string
+		next http.HandlerFunc
+	}{
+		{"детали группы", handler.GetGroupDetails},
+		{"приглашение", handler.GenerateInvite},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called = false
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/groups", nil)
+			req = req.WithContext(context.WithValue(req.Context(), middleware.UserIDKey, uuid.NewString()))
+			rr := httptest.NewRecorder()
+			tc.next(rr, req)
+			if called {
+				t.Fatal("Сервис вызван без context группы")
+			}
+			checkErrorResponse(t, rr, 500, "internal", "")
+		})
 	}
 }

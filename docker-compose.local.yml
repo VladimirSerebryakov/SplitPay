@@ -1,0 +1,12 @@
+services:
+  postgres:
+    ports:
+      - "${LOCAL_BIND_ADDR:-127.0.0.1}:${DB_PORT:-5432}:5432"
+
+  redis:
+    ports:
+      - "${LOCAL_BIND_ADDR:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
+
+  api:
+    ports:
+      - "${LOCAL_BIND_ADDR:-127.0.0.1}:${PORT:-8080}:8080"

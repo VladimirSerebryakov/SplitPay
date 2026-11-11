@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"splitpay/internal/domain"
+
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
@@ -100,6 +102,7 @@ func TestGroupAccessErrorResponses(t *testing.T) {
 		{"нет пользователя", "", groupID, false, nil, 401, "unauthorized", false},
 		{"неверный пользователь", "wrong", groupID, false, nil, 401, "unauthorized", false},
 		{"неверная группа", userID, "wrong", false, nil, 400, "validation_failed", false},
+		{"группа не найдена", userID, groupID, false, fmt.Errorf("проверка: %w", domain.ErrNotFound), 404, "not_found", true},
 		{"нет членства", userID, groupID, false, nil, 403, "forbidden", true},
 		{"сбой хранилища", userID, groupID, false, fmt.Errorf("проверка: %w", errors.New("БД недоступна")), 500, "internal", true},
 		{"доступ разрешён", userID, groupID, true, nil, 204, "", true},
@@ -113,9 +116,16 @@ func TestGroupAccessErrorResponses(t *testing.T) {
 				}
 				return tc.member, tc.err
 			})
-			next := RequireGroupAccess(checker)(func(w http.ResponseWriter, _ *http.Request) { called = true; w.WriteHeader(204) })
+			next := RequireGroupAccess(checker)(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				id, err := GetGroupID(r.Context())
+				if err != nil || id.String() != groupID {
+					t.Fatalf("Не передан UUID группы: %v, %v", id, err)
+				}
+				w.WriteHeader(204)
+			})
 			req := httptest.NewRequest(http.MethodGet, "/api/v1/groups/"+tc.groupID, nil)
-			req.SetPathValue("id", tc.groupID)
+			req.SetPathValue("groupId", tc.groupID)
 			if tc.userID != "" {
 				req = req.WithContext(context.WithValue(req.Context(), UserIDKey, tc.userID))
 			}
@@ -130,5 +140,12 @@ func TestGroupAccessErrorResponses(t *testing.T) {
 				t.Fatal("Не выполнен обработчик")
 			}
 		})
+	}
+}
+
+func TestGetGroupIDMissingContext(t *testing.T) {
+	id, err := GetGroupID(context.Background())
+	if id != uuid.Nil || err == nil || errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("Ожидалась внутренняя ошибка отсутствующего context: %v, %v", id, err)
 	}
 }

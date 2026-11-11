@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	"splitpay/internal/domain"
@@ -13,6 +14,8 @@ import (
 type GroupAccessChecker interface {
 	IsUserInGroup(ctx context.Context, groupID, userID uuid.UUID) (bool, error)
 }
+
+type groupIDKey struct{}
 
 func RequireGroupAccess(checker GroupAccessChecker) func(http.HandlerFunc) http.HandlerFunc {
 	return func(next http.HandlerFunc) http.HandlerFunc {
@@ -29,7 +32,7 @@ func RequireGroupAccess(checker GroupAccessChecker) func(http.HandlerFunc) http.
 				return
 			}
 
-			groupIDStr := r.PathValue("id")
+			groupIDStr := r.PathValue("groupId")
 			groupID, err := uuid.Parse(groupIDStr)
 			if err != nil {
 				response.WriteError(w, r, &domain.ValidationError{Fields: map[string]string{
@@ -49,7 +52,17 @@ func RequireGroupAccess(checker GroupAccessChecker) func(http.HandlerFunc) http.
 				return
 			}
 
-			next(w, r)
+			ctx := context.WithValue(r.Context(), groupIDKey{}, groupID)
+			next(w, r.WithContext(ctx))
 		}
 	}
+}
+
+// GetGroupID возвращает UUID группы, проверенный RequireGroupAccess.
+func GetGroupID(ctx context.Context) (uuid.UUID, error) {
+	id, ok := ctx.Value(groupIDKey{}).(uuid.UUID)
+	if !ok {
+		return uuid.Nil, fmt.Errorf("Идентификатор группы отсутствует в контексте запроса")
+	}
+	return id, nil
 }

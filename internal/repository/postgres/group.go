@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"time"
 
+	"splitpay/internal/domain"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"splitpay/internal/domain"
 )
 
 type GroupRepository struct {
@@ -125,17 +126,25 @@ func (r *GroupRepository) GetGroupMembers(ctx context.Context, groupID uuid.UUID
 
 func (r *GroupRepository) IsUserInGroup(ctx context.Context, groupID, userID uuid.UUID) (bool, error) {
 	query := `
-		SELECT EXISTS(
-			SELECT 1 FROM group_members
-			WHERE group_id = $1 AND user_id = $2
-		)
+		SELECT EXISTS (
+            SELECT 1
+            FROM group_members gm
+            WHERE gm.group_id = g.id
+              AND gm.user_id = $2
+        )
+        FROM groups g
+        WHERE g.id = $1
 	`
-	var exists bool
-	err := r.db.QueryRow(ctx, query, groupID, userID).Scan(&exists)
+	q := querierFrom(ctx, r.db)
+	var isMember bool
+	err := q.QueryRow(ctx, query, groupID, userID).Scan(&isMember)
 	if err != nil {
-		return false, fmt.Errorf("failed to check user membership: %w", err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, domain.ErrNotFound
+		}
+		return false, fmt.Errorf("Проверка членства в группе: %w", err)
 	}
-	return exists, nil
+	return isMember, nil
 }
 
 func (r *GroupRepository) AddUserToGroup(ctx context.Context, groupID, userID uuid.UUID) error {

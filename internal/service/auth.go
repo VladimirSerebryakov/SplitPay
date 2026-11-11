@@ -23,19 +23,20 @@ type AuthRepository interface {
 	CreateUser(ctx context.Context, user *domain.User) error
 	GetUserByEmail(ctx context.Context, email string) (*domain.User, error)
 	CreateRefreshSession(ctx context.Context, session *domain.RefreshSession) error
-	GetRefreshSession(ctx context.Context, token string) (*domain.RefreshSession, error)
-	DeleteRefreshSession(ctx context.Context, token string) error
+	RevokeRefreshSession(ctx context.Context, tokenHash string) (uuid.UUID, error)
 }
 
 type AuthService struct {
 	repo      AuthRepository
+	tx        TxManager
 	jwtSecret string
 }
 
-func NewAuthService(repo AuthRepository, jwtSecret string) *AuthService {
+func NewAuthService(repo AuthRepository, jwtSecret string, manager TxManager) *AuthService {
 	return &AuthService{
 		repo:      repo,
 		jwtSecret: jwtSecret,
+		tx:        manager,
 	}
 }
 
@@ -125,53 +126,60 @@ func (s *AuthService) generateAccessToken(userID uuid.UUID) (string, error) {
 
 func (s *AuthService) RefreshTokens(ctx context.Context, refreshToken string) (domain.TokenPair, error) {
 	refreshTokenHash := token.Hash(refreshToken)
-	session, err := s.repo.GetRefreshSession(ctx, refreshTokenHash)
-	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return domain.TokenPair{}, domain.ErrInvalidRefreshToken
-		}
-		return domain.TokenPair{}, fmt.Errorf("repo.GetRefreshSession: %w", err)
-	}
-
-	if session.ExpiresAt.Before(time.Now()) {
-		if err := s.repo.DeleteRefreshSession(ctx, refreshTokenHash); err != nil {
-			if !errors.Is(err, domain.ErrNotFound) {
-				return domain.TokenPair{}, fmt.Errorf("repo.DeleteRefreshSession: %w", err)
-			}
-		}
-		return domain.TokenPair{}, domain.ErrInvalidRefreshToken
-	}
-
-	if err := s.repo.DeleteRefreshSession(ctx, refreshTokenHash); err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return domain.TokenPair{}, domain.ErrInvalidRefreshToken
-		}
-		return domain.TokenPair{}, fmt.Errorf("repo.DeleteRefreshSession: %w", err)
-	}
-
-	accessToken, err := s.generateAccessToken(session.UserID)
-	if err != nil {
-		return domain.TokenPair{}, fmt.Errorf("failed to generate access token: %w", err)
-	}
 
 	newRefreshToken, newRefreshTokenHash, err := token.New()
 	if err != nil {
 		return domain.TokenPair{}, fmt.Errorf("token.New: %w", err)
 	}
-	newSession := &domain.RefreshSession{
-		UserID:    session.UserID,
-		TokenHash: newRefreshTokenHash,
-		ExpiresAt: time.Now().Add(refreshTokenTTL),
+	var tokenPair domain.TokenPair
+
+	err = s.tx.WithTx(ctx, func(txCtx context.Context) error {
+		userID, err := s.repo.RevokeRefreshSession(txCtx, refreshTokenHash)
+		if err != nil {
+			if errors.Is(err, domain.ErrNotFound) {
+				return domain.ErrInvalidRefreshToken
+			}
+			return fmt.Errorf("repo.RevokeRefreshSession: %w", err)
+		}
+
+		accessToken, err := s.generateAccessToken(userID)
+		if err != nil {
+			return fmt.Errorf("failed to generate access token: %w", err)
+		}
+
+		newSession := &domain.RefreshSession{
+			UserID:    userID,
+			TokenHash: newRefreshTokenHash,
+			ExpiresAt: time.Now().Add(refreshTokenTTL),
+		}
+
+		if err := s.repo.CreateRefreshSession(txCtx, newSession); err != nil {
+			return fmt.Errorf("repo.CreateRefreshSession: %w", err)
+		}
+
+		tokenPair.AccessToken = accessToken
+		tokenPair.RefreshToken = newRefreshToken
+		tokenPair.TokenType = "Bearer"
+		tokenPair.ExpiresIn = int(accessTokenTTL / time.Second)
+		return nil
+	})
+
+	if err != nil {
+		return domain.TokenPair{}, err
 	}
 
-	if err := s.repo.CreateRefreshSession(ctx, newSession); err != nil {
-		return domain.TokenPair{}, fmt.Errorf("repo.CreateRefreshSession: %w", err)
-	}
+	return tokenPair, nil
+}
 
-	return domain.TokenPair{
-		AccessToken:  accessToken,
-		RefreshToken: newRefreshToken,
-		TokenType:    "Bearer",
-		ExpiresIn:    int(accessTokenTTL / time.Second),
-	}, nil
+func (s *AuthService) Logout(ctx context.Context, refreshToken string) error {
+	refreshTokenHash := token.Hash(refreshToken)
+
+	_, err := s.repo.RevokeRefreshSession(ctx, refreshTokenHash)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("repo.RevokeRefreshSession: %w", err)
+	}
+	return nil
 }

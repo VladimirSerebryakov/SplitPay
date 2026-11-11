@@ -94,14 +94,11 @@ func (h *GroupHandler) GetUserGroups(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(groups)
 }
 
-// GET /api/v1/groups/{id}
+// GET /api/v1/groups/{groupId}
 func (h *GroupHandler) GetGroupDetails(w http.ResponseWriter, r *http.Request) {
-	groupIDStr := r.PathValue("id")
-	groupID, err := uuid.Parse(groupIDStr)
+	groupID, err := middleware.GetGroupID(r.Context())
 	if err != nil {
-		response.WriteError(w, r, &domain.ValidationError{Fields: map[string]string{
-			"groupId": "Неверный формат UUID группы",
-		}})
+		response.WriteError(w, r, err)
 		return
 	}
 
@@ -115,7 +112,7 @@ func (h *GroupHandler) GetGroupDetails(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(details)
 }
 
-// POST /api/v1/groups/{id}/invites
+// POST /api/v1/groups/{groupId}/invites
 func (h *GroupHandler) GenerateInvite(w http.ResponseWriter, r *http.Request) {
 	userIDStr, err := middleware.GetUserID(r.Context())
 	if err != nil {
@@ -129,12 +126,9 @@ func (h *GroupHandler) GenerateInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	groupIDStr := r.PathValue("id")
-	groupID, err := uuid.Parse(groupIDStr)
+	groupID, err := middleware.GetGroupID(r.Context())
 	if err != nil {
-		response.WriteError(w, r, &domain.ValidationError{Fields: map[string]string{
-			"groupId": "Неверный формат UUID группы",
-		}})
+		response.WriteError(w, r, err)
 		return
 	}
 

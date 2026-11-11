@@ -23,6 +23,9 @@ type mockAuthService struct {
 	signInErr     error
 	refreshTokens domain.TokenPair
 	refreshErr    error
+	logoutErr     error
+	logoutCalled  bool
+	logoutToken   string
 }
 
 func (m *mockAuthService) SignUp(context.Context, domain.SignUpInput) (*domain.User, error) {
@@ -35,6 +38,11 @@ func (m *mockAuthService) SignIn(context.Context, domain.SignInInput) (domain.To
 
 func (m *mockAuthService) RefreshTokens(context.Context, string) (domain.TokenPair, error) {
 	return m.refreshTokens, m.refreshErr
+}
+
+func (m *mockAuthService) Logout(_ context.Context, refreshToken string) error {
+	m.logoutCalled, m.logoutToken = true, refreshToken
+	return m.logoutErr
 }
 
 func TestAuthHandler_SignUp(t *testing.T) {
@@ -86,7 +94,7 @@ func TestAuthHandler_SignUp(t *testing.T) {
 }
 
 func TestAuthHandler_SignIn(t *testing.T) {
-	tokens := domain.TokenPair{AccessToken: "access", RefreshToken: "refresh"}
+	tokens := domain.TokenPair{AccessToken: "access", RefreshToken: "refresh", TokenType: "Bearer", ExpiresIn: 900}
 	for _, tc := range []struct {
 		name, body  string
 		err         error
@@ -112,7 +120,7 @@ func TestAuthHandler_SignIn(t *testing.T) {
 			if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil {
 				t.Fatal(err)
 			}
-			if rr.Code != 200 || result != tokens {
+			if rr.Code != 200 || rr.Header().Get("Content-Type") != "application/json" || result != tokens {
 				t.Fatalf("Неверный ответ: %d %s", rr.Code, rr.Body.String())
 			}
 		})
@@ -120,7 +128,7 @@ func TestAuthHandler_SignIn(t *testing.T) {
 }
 
 func TestAuthHandler_Refresh(t *testing.T) {
-	tokens := domain.TokenPair{AccessToken: "new-access", RefreshToken: "new-refresh"}
+	tokens := domain.TokenPair{AccessToken: "new-access", RefreshToken: "new-refresh", TokenType: "Bearer", ExpiresIn: 900}
 	for _, tc := range []struct {
 		name, body  string
 		err         error
@@ -146,8 +154,43 @@ func TestAuthHandler_Refresh(t *testing.T) {
 			if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil {
 				t.Fatal(err)
 			}
-			if rr.Code != 200 || result != tokens {
+			if rr.Code != 200 || rr.Header().Get("Content-Type") != "application/json" || result != tokens {
 				t.Fatalf("Неверный ответ: %d %s", rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestAuthHandler_Logout(t *testing.T) {
+	validToken := strings.Repeat("a", 43)
+	for _, tc := range []struct {
+		name, body  string
+		err         error
+		status      int
+		code, field string
+		wantToken   string
+	}{
+		{"успех", `{"refresh_token":"` + validToken + `"}`, nil, 204, "", "", validToken},
+		{"неизвестный токен", `{"refresh_token":"unknown"}`, nil, 204, "", "", "unknown"},
+		{"неверный JSON", `{`, nil, 400, "invalid_body", "", ""},
+		{"нет токена", `{}`, nil, 400, "validation_failed", "refresh_token", ""},
+		{"пустой токен", `{"refresh_token":""}`, nil, 400, "validation_failed", "refresh_token", ""},
+		{"сбой сервиса", `{"refresh_token":"refresh"}`, errors.New("секретная причина сбоя хранилища"), 500, "internal", "", "refresh"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service := &mockAuthService{logoutErr: tc.err}
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", strings.NewReader(tc.body))
+			NewAuthHandler(service).Logout(rr, req)
+			if service.logoutCalled != (tc.wantToken != "") || service.logoutToken != tc.wantToken {
+				t.Fatal("Сервис должен вызываться только с корректным телом и исходным токеном")
+			}
+			if tc.code != "" {
+				checkErrorResponse(t, rr, tc.status, tc.code, tc.field)
+				return
+			}
+			if rr.Code != http.StatusNoContent || rr.Body.Len() != 0 {
+				t.Fatalf("Ожидался код 204 без тела, получено: %d %s", rr.Code, rr.Body.String())
 			}
 		})
 	}

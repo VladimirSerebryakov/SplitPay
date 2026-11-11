@@ -15,6 +15,14 @@ type User struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
+type UserProfile struct {
+	ID             uuid.UUID `json:"id"`
+	Email          string    `json:"email"`
+	Name           string    `json:"name"`
+	CreatedAt      time.Time `json:"created_at"`
+	TelegramLinked bool      `json:"telegram_linked"`
+}
+
 type SignUpInput struct {
 	Name     string `json:"name" validate:"required"`
 	Email    string `json:"email" validate:"required,email"`

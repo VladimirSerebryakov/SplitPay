@@ -7,6 +7,7 @@ import (
 
 	"splitpay/internal/domain"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -55,12 +56,14 @@ func (r *AuthPostgres) GetUserByEmail(ctx context.Context, email string) (*domai
 }
 
 func (r *AuthPostgres) CreateRefreshSession(ctx context.Context, session *domain.RefreshSession) error {
+	q := querierFrom(ctx, r.pool)
+
 	query := `
 		INSERT INTO refresh_sessions (user_id, token_hash, expires_at)
 		VALUES ($1, $2, $3)
 		RETURNING id`
 
-	err := r.pool.QueryRow(ctx, query, session.UserID, session.TokenHash, session.ExpiresAt).Scan(&session.ID)
+	err := q.QueryRow(ctx, query, session.UserID, session.TokenHash, session.ExpiresAt).Scan(&session.ID)
 	if err != nil {
 		return fmt.Errorf("failed to create refresh session: %w", err)
 	}
@@ -86,9 +89,10 @@ func (r *AuthPostgres) GetRefreshSession(ctx context.Context, token string) (*do
 }
 
 func (r *AuthPostgres) DeleteRefreshSession(ctx context.Context, token string) error {
+	q := querierFrom(ctx, r.pool)
 	query := `DELETE FROM refresh_sessions WHERE token_hash = $1`
 
-	tag, err := r.pool.Exec(ctx, query, token)
+	tag, err := q.Exec(ctx, query, token)
 	if err != nil {
 		return fmt.Errorf("failed to delete refresh session: %w", err)
 	}
@@ -96,4 +100,23 @@ func (r *AuthPostgres) DeleteRefreshSession(ctx context.Context, token string) e
 		return domain.ErrNotFound
 	}
 	return nil
+}
+
+func (r *AuthPostgres) RevokeRefreshSession(ctx context.Context, token_hash string) (uuid.UUID, error) {
+	q := querierFrom(ctx, r.pool)
+
+	query := `UPDATE refresh_sessions SET revoked_at = now()
+	WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()
+	RETURNING user_id`
+
+	var user_id uuid.UUID
+
+	err := q.QueryRow(ctx, query, token_hash).Scan(&user_id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return uuid.UUID{}, domain.ErrNotFound
+		}
+		return uuid.UUID{}, fmt.Errorf("failed to revoke refresh session: %w", err)
+	}
+	return user_id, nil
 }
