@@ -15,6 +15,7 @@ func NewRouter(
 	userHandler *v1.UserHandler,
 	authMW *middleware.AuthMiddleware,
 	rateLimiterMW *middleware.RateLimitMiddleware,
+	idempotencyMW *middleware.IdempotencyMiddleware,
 	groupAccess middleware.GroupAccessChecker,
 ) *http.ServeMux {
 	mux := http.NewServeMux()
@@ -31,13 +32,14 @@ func NewRouter(
 	mux.HandleFunc("PATCH /api/v1/me", protected(userHandler.UpdateMe))
 
 	// Для общих операций с группами достаточно авторизации.
-	mux.HandleFunc("POST /api/v1/groups", protected(groupHandler.CreateGroup))
+	mux.HandleFunc("POST /api/v1/groups", protected(idempotencyMW.Middleware(false, groupHandler.CreateGroup)))
 	mux.HandleFunc("GET /api/v1/groups", protected(groupHandler.GetUserGroups))
 	mux.HandleFunc("POST /api/v1/groups/join", protected(groupHandler.JoinGroup))
 
 	// Доступ к конкретной группе требует авторизации и членства в ней.
 	mux.HandleFunc("GET /api/v1/groups/{groupId}", protected(requireGroupAccess(groupHandler.GetGroupDetails)))
-	mux.HandleFunc("POST /api/v1/groups/{groupId}/invites", protected(requireGroupAccess(groupHandler.GenerateInvite)))
+	mux.HandleFunc("POST /api/v1/groups/{groupId}/invite", protected(requireGroupAccess(groupHandler.GenerateInvite)))
+	mux.HandleFunc("DELETE /api/v1/groups/{groupId}/invite", protected(requireGroupAccess(groupHandler.RevokeInvite)))
 
 	return mux
 }

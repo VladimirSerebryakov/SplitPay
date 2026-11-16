@@ -5,123 +5,139 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	"splitpay/internal/domain"
+	"splitpay/internal/token"
+
+	"github.com/google/uuid"
 )
 
 type GroupRepository interface {
 	Create(ctx context.Context, group *domain.Group) error
 	GetGroupByID(ctx context.Context, groupID uuid.UUID) (*domain.Group, error)
-	GetUserGroups(ctx context.Context, userID uuid.UUID) ([]domain.Group, error)
+	GetUserGroups(ctx context.Context, userID uuid.UUID) ([]domain.GroupSummary, error)
 	GetGroupMembers(ctx context.Context, groupID uuid.UUID) ([]domain.GroupMemberInfo, error)
-	IsUserInGroup(ctx context.Context, groupID, userID uuid.UUID) (bool, error)
-	AddUserToGroup(ctx context.Context, groupID, userID uuid.UUID) error
-	UpsertInvite(ctx context.Context, groupID uuid.UUID, token string, expiresAt time.Time) error
-	GetInvite(ctx context.Context, token string) (*domain.GroupInvite, error)
+	GetMemberRole(ctx context.Context, groupID, userID uuid.UUID) (string, error)
+	AddMember(ctx context.Context, groupID, userID uuid.UUID, role string) (bool, error)
+	UpsertInvite(ctx context.Context, invite *domain.GroupInvite) error
+	GetInvite(ctx context.Context, tokenHash string) (*domain.GroupInvite, error)
+	DeleteInvite(ctx context.Context, groupID uuid.UUID) error
 }
 
 type GroupService struct {
 	repo GroupRepository
+	tx   TxManager
 }
 
-func NewGroupService(repo GroupRepository) *GroupService {
-	return &GroupService{repo: repo}
+func NewGroupService(repo GroupRepository, tx TxManager) *GroupService {
+	return &GroupService{repo: repo, tx: tx}
 }
 
-func (s *GroupService) CreateGroup(ctx context.Context, input domain.CreateGroupInput, userID uuid.UUID) (domain.GroupResponse, error) {
-	group := &domain.Group{
-		ID:       uuid.New(),
-		Name:     input.Name,
-		Currency: "RUB",
-		OwnerID:  userID,
+func (s *GroupService) CreateGroup(ctx context.Context, name string, userID uuid.UUID) (domain.GroupDetails, error) {
+	group := domain.Group{ID: uuid.New(), Name: name}
+	var result domain.GroupDetails
+	err := s.tx.WithTx(ctx, func(txCtx context.Context) error {
+		if err := s.repo.Create(txCtx, &group); err != nil {
+			return fmt.Errorf("Создание группы: %w", err)
+		}
+		if _, err := s.repo.AddMember(txCtx, group.ID, userID, domain.GroupRoleOwner); err != nil {
+			return fmt.Errorf("Добавление владельца группы: %w", err)
+		}
+		var err error
+		result, err = s.GetGroupDetails(txCtx, group.ID)
+		return err
+	})
+	if err != nil {
+		return domain.GroupDetails{}, err
 	}
-
-	if err := s.repo.Create(ctx, group); err != nil {
-		return domain.GroupResponse{}, fmt.Errorf("repo.Create: %w", err)
-	}
-
-	return domain.GroupResponse{
-		ID:       group.ID,
-		Name:     group.Name,
-		Currency: group.Currency,
-		OwnerID:  group.OwnerID,
-	}, nil
+	return result, nil
 }
 
-func (s *GroupService) GetUserGroups(ctx context.Context, userID uuid.UUID) ([]domain.GroupResponse, error) {
+func (s *GroupService) GetUserGroups(ctx context.Context, userID uuid.UUID) ([]domain.GroupSummary, error) {
 	groups, err := s.repo.GetUserGroups(ctx, userID)
 	if err != nil {
-		return nil, fmt.Errorf("repo.GetUserGroups: %w", err)
+		return nil, fmt.Errorf("Получение групп пользователя: %w", err)
 	}
-
-	response := make([]domain.GroupResponse, 0, len(groups))
-	for _, g := range groups {
-		response = append(response, domain.GroupResponse{
-			ID:       g.ID,
-			Name:     g.Name,
-			Currency: g.Currency,
-			OwnerID:  g.OwnerID,
-		})
-	}
-
-	return response, nil
+	return groups, nil
 }
 
-func (s *GroupService) GetGroupDetails(ctx context.Context, groupID uuid.UUID) (domain.GroupDetailsResponse, error) {
+func (s *GroupService) GetGroupDetails(ctx context.Context, groupID uuid.UUID) (domain.GroupDetails, error) {
 	group, err := s.repo.GetGroupByID(ctx, groupID)
 	if err != nil {
-		return domain.GroupDetailsResponse{}, fmt.Errorf("repo.GetGroupByID: %w", err)
+		return domain.GroupDetails{}, fmt.Errorf("Получение группы: %w", err)
 	}
-
 	members, err := s.repo.GetGroupMembers(ctx, groupID)
 	if err != nil {
-		return domain.GroupDetailsResponse{}, fmt.Errorf("repo.GetGroupMembers: %w", err)
+		return domain.GroupDetails{}, fmt.Errorf("Получение участников группы: %w", err)
 	}
-
-	return domain.GroupDetailsResponse{
-		ID:       group.ID,
-		Name:     group.Name,
-		Currency: group.Currency,
-		OwnerID:  group.OwnerID,
-		Members:  members,
-	}, nil
+	return domain.GroupDetails{Group: *group, Members: members}, nil
 }
 
-func (s *GroupService) GenerateInvite(ctx context.Context, groupID, userID uuid.UUID) (domain.InviteResponse, error) {
-	isInGroup, err := s.repo.IsUserInGroup(ctx, groupID, userID)
+func (s *GroupService) requireOwner(ctx context.Context, groupID, userID uuid.UUID) error {
+	role, err := s.repo.GetMemberRole(ctx, groupID, userID)
 	if err != nil {
-		return domain.InviteResponse{}, fmt.Errorf("repo.IsUserInGroup: %w", err)
+		return fmt.Errorf("Проверка владельца группы: %w", err)
 	}
-	if !isInGroup {
-		return domain.InviteResponse{}, domain.ErrForbidden
+	if role != domain.GroupRoleOwner {
+		return domain.ErrForbidden
 	}
-
-	token := uuid.New().String()
-	expiresAt := time.Now().Add(24 * time.Hour)
-
-	if err := s.repo.UpsertInvite(ctx, groupID, token, expiresAt); err != nil {
-		return domain.InviteResponse{}, fmt.Errorf("repo.UpsertInvite: %w", err)
-	}
-
-	return domain.InviteResponse{
-		InviteLink: token,
-		ExpiresAt:  expiresAt,
-	}, nil
-}
-
-func (s *GroupService) JoinByInvite(ctx context.Context, token string, userID uuid.UUID) error {
-	invite, err := s.repo.GetInvite(ctx, token)
-	if err != nil {
-		return fmt.Errorf("repo.GetInvite: %w", err)
-	}
-
-	if time.Now().After(invite.ExpiresAt) {
-		return domain.ErrInviteExpired
-	}
-
-	if err := s.repo.AddUserToGroup(ctx, invite.GroupID, userID); err != nil {
-		return fmt.Errorf("repo.AddUserToGroup: %w", err)
-	}
-
 	return nil
+}
+
+func (s *GroupService) GenerateInvite(ctx context.Context, groupID, userID uuid.UUID) (domain.IssuedInvite, error) {
+	plain, hash, err := token.New()
+	if err != nil {
+		return domain.IssuedInvite{}, fmt.Errorf("Создание токена приглашения: %w", err)
+	}
+	invite := domain.GroupInvite{
+		GroupID: groupID, TokenHash: hash, CreatedBy: userID,
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}
+	err = s.tx.WithTx(ctx, func(txCtx context.Context) error {
+		if err := s.requireOwner(txCtx, groupID, userID); err != nil {
+			return err
+		}
+		if err := s.repo.UpsertInvite(txCtx, &invite); err != nil {
+			return fmt.Errorf("Сохранение приглашения: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return domain.IssuedInvite{}, err
+	}
+	return domain.IssuedInvite{Token: plain, ExpiresAt: invite.ExpiresAt}, nil
+}
+
+func (s *GroupService) RevokeInvite(ctx context.Context, groupID, userID uuid.UUID) error {
+	return s.tx.WithTx(ctx, func(txCtx context.Context) error {
+		if err := s.requireOwner(txCtx, groupID, userID); err != nil {
+			return err
+		}
+		if err := s.repo.DeleteInvite(txCtx, groupID); err != nil {
+			return fmt.Errorf("Отзыв приглашения: %w", err)
+		}
+		return nil
+	})
+}
+
+func (s *GroupService) JoinByInvite(ctx context.Context, plain string, userID uuid.UUID) (domain.GroupDetails, error) {
+	hash := token.Hash(plain)
+	var result domain.GroupDetails
+	err := s.tx.WithTx(ctx, func(txCtx context.Context) error {
+		invite, err := s.repo.GetInvite(txCtx, hash)
+		if err != nil {
+			return fmt.Errorf("Получение приглашения: %w", err)
+		}
+		if !time.Now().Before(invite.ExpiresAt) {
+			return domain.ErrInviteExpired
+		}
+		if _, err := s.repo.AddMember(txCtx, invite.GroupID, userID, domain.GroupRoleMember); err != nil {
+			return fmt.Errorf("Вступление в группу: %w", err)
+		}
+		result, err = s.GetGroupDetails(txCtx, invite.GroupID)
+		return err
+	})
+	if err != nil {
+		return domain.GroupDetails{}, err
+	}
+	return result, nil
 }

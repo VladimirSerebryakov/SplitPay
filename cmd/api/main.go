@@ -65,20 +65,24 @@ func main() {
 	authRepo := postgres.NewAuthPostgres(pool)
 	groupRepo := postgres.NewGroupRepository(pool)
 	userRepo := postgres.NewUserPostgres(pool)
+	idempotencyRepo := postgres.NewIdempotencyRepository(pool)
 	manager := postgres.NewManager(pool)
+	idempotencyStorage := redis.NewIdempotencyStorage(redisClient)
 	rateLimiterStorage := redis.NewRateLimiterStorage(redisClient)
 
 	authService := service.NewAuthService(authRepo, cfg.JWTSecret, manager)
-	groupService := service.NewGroupService(groupRepo)
+	groupService := service.NewGroupService(groupRepo, manager)
 	userService := service.NewUserService(userRepo)
+	idempotencyService := service.NewIdempotencyService(idempotencyRepo, manager)
 
 	authHandler := v1.NewAuthHandler(authService)
-	groupHandler := v1.NewGroupHandler(groupService)
+	groupHandler := v1.NewGroupHandler(groupService, idempotencyService)
 	userHandler := v1.NewUserHandler(userService)
 
 	authMW := middleware.NewAuthMiddleware(cfg.JWTSecret)
 	rateLimiterMW := middleware.NewRateLimitMiddleware(rateLimiterStorage, cfg.RateLimitRequests, cfg.RateLimitWindow)
-	router := httptransport.NewRouter(authHandler, groupHandler, userHandler, authMW, rateLimiterMW, groupRepo)
+	idempotencyMW := middleware.NewIdempotencyMiddleware(idempotencyStorage)
+	router := httptransport.NewRouter(authHandler, groupHandler, userHandler, authMW, rateLimiterMW, idempotencyMW, groupRepo)
 
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,

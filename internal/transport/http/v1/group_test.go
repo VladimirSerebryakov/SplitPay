@@ -1,64 +1,47 @@
 package v1
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"splitpay/internal/domain"
 	"splitpay/internal/transport/http/middleware"
+
+	"github.com/google/uuid"
 )
 
-// mockGroupService — расширенный ручной мок для имитации бизнес-логики
 type mockGroupService struct {
-	CreateGroupFunc     func(ctx context.Context, input domain.CreateGroupInput, userID uuid.UUID) (domain.GroupResponse, error)
-	GetUserGroupsFunc   func(ctx context.Context, userID uuid.UUID) ([]domain.GroupResponse, error)
-	GetGroupDetailsFunc func(ctx context.Context, groupID uuid.UUID) (domain.GroupDetailsResponse, error)
-	GenerateInviteFunc  func(ctx context.Context, groupID, userID uuid.UUID) (domain.InviteResponse, error)
-	JoinByInviteFunc    func(ctx context.Context, token string, userID uuid.UUID) error
+	create  func(context.Context, string, uuid.UUID) (domain.GroupDetails, error)
+	list    func(context.Context, uuid.UUID) ([]domain.GroupSummary, error)
+	details func(context.Context, uuid.UUID) (domain.GroupDetails, error)
+	invite  func(context.Context, uuid.UUID, uuid.UUID) (domain.IssuedInvite, error)
+	revoke  func(context.Context, uuid.UUID, uuid.UUID) error
+	join    func(context.Context, string, uuid.UUID) (domain.GroupDetails, error)
 }
 
-func (m *mockGroupService) CreateGroup(ctx context.Context, input domain.CreateGroupInput, userID uuid.UUID) (domain.GroupResponse, error) {
-	if m.CreateGroupFunc != nil {
-		return m.CreateGroupFunc(ctx, input, userID)
-	}
-	return domain.GroupResponse{}, nil
+func (m *mockGroupService) CreateGroup(ctx context.Context, name string, id uuid.UUID) (domain.GroupDetails, error) {
+	return m.create(ctx, name, id)
 }
-
-func (m *mockGroupService) GetUserGroups(ctx context.Context, userID uuid.UUID) ([]domain.GroupResponse, error) {
-	if m.GetUserGroupsFunc != nil {
-		return m.GetUserGroupsFunc(ctx, userID)
-	}
-	return nil, nil
+func (m *mockGroupService) GetUserGroups(ctx context.Context, id uuid.UUID) ([]domain.GroupSummary, error) {
+	return m.list(ctx, id)
 }
-
-func (m *mockGroupService) GetGroupDetails(ctx context.Context, groupID uuid.UUID) (domain.GroupDetailsResponse, error) {
-	if m.GetGroupDetailsFunc != nil {
-		return m.GetGroupDetailsFunc(ctx, groupID)
-	}
-	return domain.GroupDetailsResponse{}, nil
+func (m *mockGroupService) GetGroupDetails(ctx context.Context, id uuid.UUID) (domain.GroupDetails, error) {
+	return m.details(ctx, id)
 }
-
-func (m *mockGroupService) GenerateInvite(ctx context.Context, groupID, userID uuid.UUID) (domain.InviteResponse, error) {
-	if m.GenerateInviteFunc != nil {
-		return m.GenerateInviteFunc(ctx, groupID, userID)
-	}
-	return domain.InviteResponse{}, nil
+func (m *mockGroupService) GenerateInvite(ctx context.Context, groupID, userID uuid.UUID) (domain.IssuedInvite, error) {
+	return m.invite(ctx, groupID, userID)
 }
-
-func (m *mockGroupService) JoinByInvite(ctx context.Context, token string, userID uuid.UUID) error {
-	if m.JoinByInviteFunc != nil {
-		return m.JoinByInviteFunc(ctx, token, userID)
-	}
-	return nil
+func (m *mockGroupService) RevokeInvite(ctx context.Context, groupID, userID uuid.UUID) error {
+	return m.revoke(ctx, groupID, userID)
+}
+func (m *mockGroupService) JoinByInvite(ctx context.Context, plain string, id uuid.UUID) (domain.GroupDetails, error) {
+	return m.join(ctx, plain, id)
 }
 
 type groupAccessStub struct{}
@@ -67,410 +50,221 @@ func (groupAccessStub) IsUserInGroup(context.Context, uuid.UUID, uuid.UUID) (boo
 	return true, nil
 }
 
-// === Тесты ===
-
-func TestGroupHandler_CreateGroup(t *testing.T) {
-	testUserID := uuid.New()
-
-	tests := []struct {
-		name           string
-		inputBody      interface{}
-		mockBehavior   func(m *mockGroupService)
-		expectedStatus int
-	}{
-		{
-			name:      "Success",
-			inputBody: domain.CreateGroupInput{Name: "Trip to Berlin"},
-			mockBehavior: func(m *mockGroupService) {
-				m.CreateGroupFunc = func(ctx context.Context, input domain.CreateGroupInput, userID uuid.UUID) (domain.GroupResponse, error) {
-					return domain.GroupResponse{
-						ID:       uuid.New(),
-						Name:     "Trip to Berlin",
-						Currency: "RUB",
-						OwnerID:  userID,
-					}, nil
-				}
-			},
-			expectedStatus: http.StatusCreated,
-		},
-		{
-			name:      "Invalid JSON",
-			inputBody: "not-a-json",
-			mockBehavior: func(m *mockGroupService) {
-			},
-			expectedStatus: http.StatusBadRequest,
-		},
-		{
-			name:      "Service Error",
-			inputBody: domain.CreateGroupInput{Name: "Trip to Berlin"},
-			mockBehavior: func(m *mockGroupService) {
-				m.CreateGroupFunc = func(ctx context.Context, input domain.CreateGroupInput, userID uuid.UUID) (domain.GroupResponse, error) {
-					return domain.GroupResponse{}, errors.New("database connection lost")
-				}
-			},
-			expectedStatus: http.StatusInternalServerError,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mockService := &mockGroupService{}
-			tt.mockBehavior(mockService)
-			handler := NewGroupHandler(mockService)
-
-			var reqBody []byte
-			if s, ok := tt.inputBody.(string); ok {
-				reqBody = []byte(s)
-			} else {
-				reqBody, _ = json.Marshal(tt.inputBody)
-			}
-
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/groups", bytes.NewBuffer(reqBody))
-			ctx := context.WithValue(req.Context(), middleware.UserIDKey, testUserID.String())
-			req = req.WithContext(ctx)
-
-			rr := httptest.NewRecorder()
-			handler.CreateGroup(rr, req)
-
-			if rr.Code != tt.expectedStatus {
-				t.Errorf("expected status %d, got %d. Body: %s", tt.expectedStatus, rr.Code, rr.Body.String())
-			}
-		})
-	}
+// Обычные тесты handler выполняют операцию; повторы проверяются отдельно.
+type groupIdempotencyStub struct {
+	result *domain.CachedResponse
+	err    error
 }
 
-func TestGroupHandler_GetUserGroups(t *testing.T) {
-	testUserID := uuid.New()
-
-	tests := []struct {
-		name           string
-		mockBehavior   func(m *mockGroupService)
-		expectedStatus int
-	}{
-		{
-			name: "Success",
-			mockBehavior: func(m *mockGroupService) {
-				m.GetUserGroupsFunc = func(ctx context.Context, userID uuid.UUID) ([]domain.GroupResponse, error) {
-					return []domain.GroupResponse{
-						{ID: uuid.New(), Name: "Group 1", Currency: "RUB", OwnerID: userID},
-					}, nil
-				}
-			},
-			expectedStatus: http.StatusOK,
-		},
-		{
-			name: "Service Error",
-			mockBehavior: func(m *mockGroupService) {
-				m.GetUserGroupsFunc = func(ctx context.Context, userID uuid.UUID) ([]domain.GroupResponse, error) {
-					return nil, errors.New("db error")
-				}
-			},
-			expectedStatus: http.StatusInternalServerError,
-		},
+func (s groupIdempotencyStub) Execute(ctx context.Context, _ uuid.UUID,
+	run func(context.Context) (domain.CachedResponse, error)) (domain.CachedResponse, error) {
+	if s.err != nil {
+		return domain.CachedResponse{}, s.err
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mockService := &mockGroupService{}
-			tt.mockBehavior(mockService)
-			handler := NewGroupHandler(mockService)
-
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/groups", nil)
-			ctx := context.WithValue(req.Context(), middleware.UserIDKey, testUserID.String())
-			req = req.WithContext(ctx)
-
-			rr := httptest.NewRecorder()
-			handler.GetUserGroups(rr, req)
-
-			if rr.Code != tt.expectedStatus {
-				t.Errorf("expected status %d, got %d", tt.expectedStatus, rr.Code)
-			}
-		})
+	if s.result != nil {
+		return *s.result, nil
 	}
+	return run(ctx)
 }
 
-func TestGroupHandler_GetGroupDetails(t *testing.T) {
-	testUserID := uuid.New()
-	validGroupID := uuid.New()
-
-	tests := []struct {
-		name           string
-		pathID         string
-		mockBehavior   func(m *mockGroupService)
-		expectedStatus int
-	}{
-		{
-			name:   "Success",
-			pathID: validGroupID.String(),
-			mockBehavior: func(m *mockGroupService) {
-				m.GetGroupDetailsFunc = func(ctx context.Context, groupID uuid.UUID) (domain.GroupDetailsResponse, error) {
-					if groupID != validGroupID {
-						t.Fatalf("В сервис передан неверный UUID группы: %v", groupID)
-					}
-					return domain.GroupDetailsResponse{
-						ID: groupID, Name: "Detailed Group", Currency: "RUB", OwnerID: testUserID,
-					}, nil
-				}
-			},
-			expectedStatus: http.StatusOK,
-		},
-		{
-			name:   "Not Found / Service Error",
-			pathID: validGroupID.String(),
-			mockBehavior: func(m *mockGroupService) {
-				m.GetGroupDetailsFunc = func(ctx context.Context, groupID uuid.UUID) (domain.GroupDetailsResponse, error) {
-					return domain.GroupDetailsResponse{}, domain.ErrNotFound
-				}
-			},
-			expectedStatus: http.StatusNotFound,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mockService := &mockGroupService{}
-			tt.mockBehavior(mockService)
-			handler := NewGroupHandler(mockService)
-
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/groups/"+tt.pathID, nil)
-			req.SetPathValue("groupId", tt.pathID)
-
-			ctx := context.WithValue(req.Context(), middleware.UserIDKey, testUserID.String())
-			req = req.WithContext(ctx)
-
-			rr := httptest.NewRecorder()
-			middleware.RequireGroupAccess(groupAccessStub{})(handler.GetGroupDetails)(rr, req)
-
-			if rr.Code != tt.expectedStatus {
-				t.Errorf("expected status %d, got %d. Body: %s", tt.expectedStatus, rr.Code, rr.Body.String())
-			}
-		})
-	}
-}
-
-func TestGroupHandler_GenerateInvite(t *testing.T) {
-	testUserID := uuid.New()
-	validGroupID := uuid.New()
-
-	tests := []struct {
-		name           string
-		pathID         string
-		mockBehavior   func(m *mockGroupService)
-		expectedStatus int
-	}{
-		{
-			name:   "Success",
-			pathID: validGroupID.String(),
-			mockBehavior: func(m *mockGroupService) {
-				m.GenerateInviteFunc = func(ctx context.Context, groupID, userID uuid.UUID) (domain.InviteResponse, error) {
-					if groupID != validGroupID || userID != testUserID {
-						t.Fatalf("В сервис переданы неверные UUID: группа=%v, пользователь=%v", groupID, userID)
-					}
-					return domain.InviteResponse{
-						InviteLink: "invite-token-123",
-						ExpiresAt:  time.Now().Add(24 * time.Hour),
-					}, nil
-				}
-			},
-			expectedStatus: http.StatusOK,
-		},
-		{
-			name:   "User Not In Group Error",
-			pathID: validGroupID.String(),
-			mockBehavior: func(m *mockGroupService) {
-				m.GenerateInviteFunc = func(ctx context.Context, groupID, userID uuid.UUID) (domain.InviteResponse, error) {
-					return domain.InviteResponse{}, domain.ErrForbidden
-				}
-			},
-			expectedStatus: http.StatusForbidden,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mockService := &mockGroupService{}
-			tt.mockBehavior(mockService)
-			handler := NewGroupHandler(mockService)
-
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/groups/"+tt.pathID+"/invites", nil)
-			req.SetPathValue("groupId", tt.pathID)
-			ctx := context.WithValue(req.Context(), middleware.UserIDKey, testUserID.String())
-			req = req.WithContext(ctx)
-
-			rr := httptest.NewRecorder()
-			middleware.RequireGroupAccess(groupAccessStub{})(handler.GenerateInvite)(rr, req)
-
-			if rr.Code != tt.expectedStatus {
-				t.Errorf("expected status %d, got %d", tt.expectedStatus, rr.Code)
-			}
-		})
-	}
-}
-
-func TestGroupHandler_JoinGroup(t *testing.T) {
-	testUserID := uuid.New()
-
-	tests := []struct {
-		name           string
-		inputBody      interface{}
-		mockBehavior   func(m *mockGroupService)
-		expectedStatus int
-	}{
-		{
-			name:      "Success",
-			inputBody: domain.JoinGroupInput{Token: "valid-token"},
-			mockBehavior: func(m *mockGroupService) {
-				m.JoinByInviteFunc = func(ctx context.Context, token string, userID uuid.UUID) error {
-					return nil
-				}
-			},
-			expectedStatus: http.StatusOK,
-		},
-		{
-			name:      "Expired Token",
-			inputBody: domain.JoinGroupInput{Token: "expired-token"},
-			mockBehavior: func(m *mockGroupService) {
-				m.JoinByInviteFunc = func(ctx context.Context, token string, userID uuid.UUID) error {
-					return domain.ErrInviteExpired
-				}
-			},
-			expectedStatus: http.StatusBadRequest,
-		},
-		{
-			name:      "Token Not Found",
-			inputBody: domain.JoinGroupInput{Token: "unknown-token"},
-			mockBehavior: func(m *mockGroupService) {
-				m.JoinByInviteFunc = func(ctx context.Context, token string, userID uuid.UUID) error {
-					return domain.ErrNotFound
-				}
-			},
-			expectedStatus: http.StatusNotFound,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mockService := &mockGroupService{}
-			tt.mockBehavior(mockService)
-			handler := NewGroupHandler(mockService)
-
-			var reqBody []byte
-			if s, ok := tt.inputBody.(string); ok {
-				reqBody = []byte(s)
-			} else {
-				reqBody, _ = json.Marshal(tt.inputBody)
-			}
-
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/groups/join", bytes.NewBuffer(reqBody))
-			ctx := context.WithValue(req.Context(), middleware.UserIDKey, testUserID.String())
-			req = req.WithContext(ctx)
-
-			rr := httptest.NewRecorder()
-			handler.JoinGroup(rr, req)
-
-			if rr.Code != tt.expectedStatus {
-				t.Errorf("expected status %d, got %d. Body: %s", tt.expectedStatus, rr.Code, rr.Body.String())
-			}
-		})
-	}
-}
-
-func TestGroupHandlerErrorResponses(t *testing.T) {
+func TestGroupHandlers(t *testing.T) {
 	internalErr := errors.New("секретная причина сбоя хранилища")
-	group := NewGroupHandler(&mockGroupService{
-		CreateGroupFunc: func(context.Context, domain.CreateGroupInput, uuid.UUID) (domain.GroupResponse, error) {
-			return domain.GroupResponse{}, internalErr
-		},
-		GetUserGroupsFunc: func(context.Context, uuid.UUID) ([]domain.GroupResponse, error) { return nil, internalErr },
-		GetGroupDetailsFunc: func(context.Context, uuid.UUID) (domain.GroupDetailsResponse, error) {
-			return domain.GroupDetailsResponse{}, fmt.Errorf("группа: %w", domain.ErrNotFound)
-		},
-		GenerateInviteFunc: func(context.Context, uuid.UUID, uuid.UUID) (domain.InviteResponse, error) {
-			return domain.InviteResponse{}, fmt.Errorf("приглашение: %w", domain.ErrForbidden)
-		},
-		JoinByInviteFunc: func(context.Context, string, uuid.UUID) error {
-			return fmt.Errorf("приглашение: %w", domain.ErrNotFound)
-		},
-	})
 	for _, tc := range []struct {
-		name    string
-		handler http.HandlerFunc
-		body    string
-		groupID string
-		status  int
-		code    string
-		field   string
+		name, action, body string
+		err                error
+		status             int
+		code, field        string
 	}{
-		{"group JSON", group.CreateGroup, `{`, "", 400, "invalid_body", ""},
-		{"group name", group.CreateGroup, `{"name":"  "}`, "", 400, "validation_failed", "name"},
-		{"join JSON", group.JoinGroup, `{`, "", 400, "invalid_body", ""},
-		{"join token", group.JoinGroup, `{}`, "", 400, "validation_failed", "token"},
-		{"create failure", group.CreateGroup, `{"name":"Поездка"}`, "", 500, "internal", ""},
-		{"list failure", group.GetUserGroups, "", "", 500, "internal", ""},
-		{"group missing", group.GetGroupDetails, "", uuid.NewString(), 404, "not_found", ""},
-		{"invite forbidden", group.GenerateInvite, "", uuid.NewString(), 403, "forbidden", ""},
-		{"invite missing", group.JoinGroup, `{"token":"wrong"}`, "", 404, "not_found", ""},
+		{"создание", "create", `{"name":"  Поездка  "}`, nil, 201, "", ""},
+		{"имя 100 символов", "create", `{"name":"` + strings.Repeat("я", 100) + `"}`, nil, 201, "", ""},
+		{"имя 101 символ", "create", `{"name":"` + strings.Repeat("я", 101) + `"}`, nil, 400, "validation_failed", "name"},
+		{"пустое имя", "create", `{"name":"  "}`, nil, 400, "validation_failed", "name"},
+		{"неверный JSON", "create", `{`, nil, 400, "invalid_body", ""},
+		{"ошибка создания", "create", `{"name":"Поездка"}`, internalErr, 500, "internal", ""},
+		{"список", "list", "", nil, 200, "", ""},
+		{"ошибка списка", "list", "", internalErr, 500, "internal", ""},
+		{"детали", "details", "", nil, 200, "", ""},
+		{"группа не найдена", "details", "", domain.ErrNotFound, 404, "not_found", ""},
+		{"приглашение", "invite", "", nil, 201, "", ""},
+		{"приглашение только owner", "invite", "", domain.ErrForbidden, 403, "forbidden", ""},
+		{"ошибка приглашения", "invite", "", internalErr, 500, "internal", ""},
+		{"отзыв", "revoke", "", nil, 204, "", ""},
+		{"отзыв только owner", "revoke", "", domain.ErrForbidden, 403, "forbidden", ""},
+		{"ошибка отзыва", "revoke", "", internalErr, 500, "internal", ""},
+		{"вступление", "join", `{"token":"secret-token"}`, nil, 200, "", ""},
+		{"ссылка истекла", "join", `{"token":"secret-token"}`, domain.ErrInviteExpired, 400, "invite_expired", ""},
+		{"ссылка не найдена", "join", `{"token":"secret-token"}`, domain.ErrNotFound, 404, "not_found", ""},
+		{"нет токена", "join", `{}`, nil, 400, "validation_failed", "token"},
+		{"JSON вступления", "join", `{`, nil, 400, "invalid_body", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			userID, groupID := uuid.New(), uuid.New()
+			created := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+			group := domain.GroupDetails{Group: domain.Group{ID: groupID, Name: "Поездка", CreatedAt: created}, Members: []domain.GroupMemberInfo{{UserID: userID, Name: "Иван", Role: "owner", JoinedAt: created}}}
+			service := &mockGroupService{
+				create: func(_ context.Context, name string, id uuid.UUID) (domain.GroupDetails, error) {
+					if id != userID || name != strings.TrimSpace(name) {
+						t.Fatal("Неверные данные создания")
+					}
+					return group, tc.err
+				},
+				list: func(context.Context, uuid.UUID) ([]domain.GroupSummary, error) {
+					return []domain.GroupSummary{{ID: groupID, Name: "Поездка", MyRole: "owner", MembersCount: 2, MyBalance: -123}}, tc.err
+				},
+				details: func(_ context.Context, id uuid.UUID) (domain.GroupDetails, error) {
+					if id != groupID {
+						t.Fatal("Неверный UUID группы")
+					}
+					return group, tc.err
+				},
+				invite: func(_ context.Context, g, u uuid.UUID) (domain.IssuedInvite, error) {
+					if g != groupID || u != userID {
+						t.Fatal("Неверные UUID приглашения")
+					}
+					return domain.IssuedInvite{Token: "secret-token", ExpiresAt: created.Add(24 * time.Hour)}, tc.err
+				},
+				revoke: func(_ context.Context, g, u uuid.UUID) error {
+					if g != groupID || u != userID {
+						t.Fatal("Неверные UUID отзыва")
+					}
+					return tc.err
+				},
+				join: func(_ context.Context, plain string, id uuid.UUID) (domain.GroupDetails, error) {
+					if plain != "secret-token" || id != userID {
+						t.Fatal("Неверные данные вступления")
+					}
+					return group, tc.err
+				},
+			}
+			h := NewGroupHandler(service, groupIdempotencyStub{})
+			handlers := map[string]http.HandlerFunc{"create": h.CreateGroup, "list": h.GetUserGroups, "details": h.GetGroupDetails, "invite": h.GenerateInvite, "revoke": h.RevokeInvite, "join": h.JoinGroup}
+			next := handlers[tc.action]
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/groups", strings.NewReader(tc.body))
-			req.SetPathValue("groupId", tc.groupID)
-			req = req.WithContext(context.WithValue(req.Context(), middleware.UserIDKey, uuid.NewString()))
-			rr := httptest.NewRecorder()
-			next := tc.handler
-			if tc.groupID != "" {
+			req = req.WithContext(context.WithValue(req.Context(), middleware.UserIDKey, userID.String()))
+			if tc.action == "details" || tc.action == "invite" || tc.action == "revoke" {
+				req.SetPathValue("groupId", groupID.String())
 				next = middleware.RequireGroupAccess(groupAccessStub{})(next)
 			}
+			rr := httptest.NewRecorder()
 			next(rr, req)
-			checkErrorResponse(t, rr, tc.status, tc.code, tc.field)
+			if tc.status >= 400 {
+				checkErrorResponse(t, rr, tc.status, tc.code, tc.field)
+				return
+			}
+			if rr.Code != tc.status {
+				t.Fatalf("Статус %d, ожидался %d: %s", rr.Code, tc.status, rr.Body.String())
+			}
+			if tc.status == 204 {
+				if rr.Body.Len() != 0 {
+					t.Fatal("Ответ 204 содержит тело")
+				}
+				return
+			}
+			if rr.Header().Get("Content-Type") != "application/json" {
+				t.Fatal("Нет JSON Content-Type")
+			}
+			switch tc.action {
+			case "list":
+				var got groupListResponse
+				if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+					t.Fatal(err)
+				}
+				if len(got.Items) != 1 || got.Items[0].ID != groupID || got.Items[0].MyRole != "owner" || got.Items[0].MembersCount != 2 || got.Items[0].MyBalance != -123 {
+					t.Fatalf("Неверный список: %s", rr.Body.String())
+				}
+			case "invite":
+				var got inviteResponse
+				decoder := json.NewDecoder(rr.Body)
+				decoder.DisallowUnknownFields()
+				if err := decoder.Decode(&got); err != nil {
+					t.Fatal(err)
+				}
+				if got.Token != "secret-token" || !got.ExpiresAt.Equal(created.Add(24*time.Hour)) {
+					t.Fatal("Неверное приглашение")
+				}
+			default:
+				var got groupDetailsResponse
+				decoder := json.NewDecoder(rr.Body)
+				decoder.DisallowUnknownFields()
+				if err := decoder.Decode(&got); err != nil {
+					t.Fatal(err)
+				}
+				if got.ID != groupID || got.Name != "Поездка" || !got.CreatedAt.Equal(created) || len(got.Members) != 1 {
+					t.Fatal("Неверные детали группы")
+				}
+				member := got.Members[0]
+				if member.UserID != userID || member.Name != "Иван" || member.Role != "owner" || !member.JoinedAt.Equal(created) {
+					t.Fatal("Неверный участник")
+				}
+			}
 		})
 	}
 }
 
-func TestGroupHandlersRequireUser(t *testing.T) {
-	handler := NewGroupHandler(&mockGroupService{})
-	for _, invalidID := range []string{"", "wrong"} {
-		for _, next := range []http.HandlerFunc{handler.CreateGroup, handler.GetUserGroups, handler.GenerateInvite, handler.JoinGroup} {
+func TestGroupListEmpty(t *testing.T) {
+	h := NewGroupHandler(&mockGroupService{list: func(context.Context, uuid.UUID) ([]domain.GroupSummary, error) { return nil, nil }}, groupIdempotencyStub{})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/groups", nil)
+	req = req.WithContext(context.WithValue(req.Context(), middleware.UserIDKey, uuid.NewString()))
+	rr := httptest.NewRecorder()
+	h.GetUserGroups(rr, req)
+	if strings.TrimSpace(rr.Body.String()) != `{"items":[]}` {
+		t.Fatalf("Неверный пустой список: %s", rr.Body.String())
+	}
+}
+
+func TestGroupHandlersMissingContext(t *testing.T) {
+	// Вызов сервиса здесь недопустим: у заглушки намеренно нет обработчиков.
+	h := NewGroupHandler(&mockGroupService{}, groupIdempotencyStub{})
+	for _, next := range []http.HandlerFunc{h.CreateGroup, h.GetUserGroups, h.GenerateInvite, h.RevokeInvite, h.JoinGroup} {
+		for _, userID := range []string{"", "wrong"} {
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/groups", nil)
-			req.SetPathValue("groupId", uuid.NewString())
-			if invalidID != "" {
-				req = req.WithContext(context.WithValue(req.Context(), middleware.UserIDKey, invalidID))
+			if userID != "" {
+				req = req.WithContext(context.WithValue(req.Context(), middleware.UserIDKey, userID))
 			}
 			rr := httptest.NewRecorder()
 			next(rr, req)
 			checkErrorResponse(t, rr, 401, "unauthorized", "")
 		}
 	}
+	for _, next := range []http.HandlerFunc{h.GetGroupDetails, h.GenerateInvite, h.RevokeInvite} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/groups", nil)
+		req = req.WithContext(context.WithValue(req.Context(), middleware.UserIDKey, uuid.NewString()))
+		rr := httptest.NewRecorder()
+		next(rr, req)
+		checkErrorResponse(t, rr, 500, "internal", "")
+	}
 }
 
-func TestGroupHandlersRequireGroupContext(t *testing.T) {
-	called := false
-	handler := NewGroupHandler(&mockGroupService{
-		GetGroupDetailsFunc: func(context.Context, uuid.UUID) (domain.GroupDetailsResponse, error) {
-			called = true
-			return domain.GroupDetailsResponse{}, nil
-		},
-		GenerateInviteFunc: func(context.Context, uuid.UUID, uuid.UUID) (domain.InviteResponse, error) {
-			called = true
-			return domain.InviteResponse{}, nil
-		},
-	})
+func TestCreateGroupSavedResult(t *testing.T) {
+	saved := domain.CachedResponse{
+		ResponseCode: http.StatusCreated,
+		ResponseBody: json.RawMessage(`{"id":"f57fbdfb-297f-4f88-ae17-fc946411cb53","name":"Поездка","created_at":"2026-11-16T12:00:00Z","members":[]}`),
+	}
 	for _, tc := range []struct {
-		name string
-		next http.HandlerFunc
+		name   string
+		body   string
+		err    error
+		status int
+		code   string
 	}{
-		{"детали группы", handler.GetGroupDetails},
-		{"приглашение", handler.GenerateInvite},
+		{"сохранённый ответ", `{"name":"Поездка"}`, nil, 201, ""},
+		{"другое тело запроса", `{`, domain.ErrIdempotencyKeyMismatch, 422, "idempotency_key_mismatch"},
+		{"ошибка транзакции", `{`, errors.New("секретная причина сбоя хранилища"), 500, "internal"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			called = false
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/groups", nil)
+			// Невалидное тело не должно разбираться до проверки сохранённого ключа.
+			h := NewGroupHandler(&mockGroupService{}, groupIdempotencyStub{result: &saved, err: tc.err})
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/groups", strings.NewReader(tc.body))
 			req = req.WithContext(context.WithValue(req.Context(), middleware.UserIDKey, uuid.NewString()))
 			rr := httptest.NewRecorder()
-			tc.next(rr, req)
-			if called {
-				t.Fatal("Сервис вызван без context группы")
+			h.CreateGroup(rr, req)
+			if tc.err != nil {
+				checkErrorResponse(t, rr, tc.status, tc.code, "")
+				return
 			}
-			checkErrorResponse(t, rr, 500, "internal", "")
+			if rr.Code != tc.status || rr.Header().Get("Content-Type") != "application/json" || rr.Body.String() != string(saved.ResponseBody) {
+				t.Fatalf("Изменился сохранённый ответ: %d %s", rr.Code, rr.Body.String())
+			}
 		})
 	}
 }

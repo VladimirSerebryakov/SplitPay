@@ -2,272 +2,411 @@ package integration_test
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
-
 	"splitpay/internal/domain"
 	repo "splitpay/internal/repository/postgres"
+	"splitpay/internal/service"
+	"splitpay/internal/token"
+	httptransport "splitpay/internal/transport/http"
+	"splitpay/internal/transport/http/middleware"
+	"splitpay/internal/transport/http/v1"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func setupTestDB(t *testing.T) (*pgxpool.Pool, func()) {
-	ctx := context.Background()
-
-	pgContainer, err := postgres.RunContainer(ctx,
-		testcontainers.WithImage("postgres:15-alpine"),
-		postgres.WithDatabase("testdb"),
-		postgres.WithUsername("testuser"),
-		postgres.WithPassword("testpass"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(10*time.Second),
-		),
-	)
+func createGroupTestUser(t *testing.T, pool *pgxpool.Pool, name string) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	_, err := pool.Exec(context.Background(), `INSERT INTO users (id, email, name, password_hash) VALUES ($1, $2, $3, 'test-hash')`, id, id.String()+"@example.com", name)
 	if err != nil {
-		t.Fatalf("failed to start postgres container: %v", err)
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestGroupServiceIntegration(t *testing.T) {
+	// Helper поднимает отдельный PostgreSQL 16 и применяет настоящие миграции.
+	pool := setupUserTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	storage := repo.NewGroupRepository(pool)
+	manager := repo.NewManager(pool)
+	groups := service.NewGroupService(storage, manager)
+	owner := createGroupTestUser(t, pool, "Владелец")
+	member := createGroupTestUser(t, pool, "Участник")
+	outsider := createGroupTestUser(t, pool, "Посторонний")
+
+	group, err := groups.CreateGroup(ctx, "Поездка", owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if group.ID == uuid.Nil || group.CreatedAt.IsZero() || len(group.Members) != 1 || group.Members[0].UserID != owner || group.Members[0].Name != "Владелец" || group.Members[0].Role != "owner" {
+		t.Fatalf("Неверная группа: %+v", group)
 	}
 
-	connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("failed to get connection string: %v", err)
-	}
-
-	pool, err := pgxpool.New(ctx, connStr)
-	if err != nil {
-		t.Fatalf("failed to connect to postgres: %v", err)
-	}
-
-	// Накатываем структуру таблиц для теста
-	schema := `
-		CREATE TABLE users (
-			id UUID PRIMARY KEY,
-			email VARCHAR(255) UNIQUE NOT NULL,
-			password_hash VARCHAR(255) NOT NULL,
-			created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-		);
-
-		CREATE TABLE groups (
-			id UUID PRIMARY KEY,
-			name VARCHAR(255) NOT NULL,
-			currency VARCHAR(10) NOT NULL,
-			owner_id UUID REFERENCES users(id) ON DELETE CASCADE
-		);
-
-		CREATE TABLE group_members (
-			group_id UUID REFERENCES groups(id) ON DELETE CASCADE,
-			user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-			role VARCHAR(50) NOT NULL,
-			joined_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-			PRIMARY KEY (group_id, user_id)
-		);
-	`
-	_, err = pool.Exec(ctx, schema)
-	if err != nil {
-		t.Fatalf("failed to create schema: %v", err)
-	}
-
-	cleanup := func() {
-		pool.Close()
-		if err := pgContainer.Terminate(ctx); err != nil {
-			t.Fatalf("failed to terminate container: %v", err)
+	t.Run("проверка доступа и отсутствующей группы", func(t *testing.T) {
+		for _, tc := range []struct {
+			id   uuid.UUID
+			want bool
+		}{{owner, true}, {outsider, false}} {
+			got, err := storage.IsUserInGroup(ctx, group.ID, tc.id)
+			if err != nil || got != tc.want {
+				t.Fatalf("Членство=%t, ошибка=%v", got, err)
+			}
 		}
+		if _, err := storage.IsUserInGroup(ctx, uuid.New(), owner); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("Ожидалась отсутствующая группа: %v", err)
+		}
+	})
+
+	t.Run("rollback группы при ошибке добавления owner", func(t *testing.T) {
+		if _, err := groups.CreateGroup(ctx, "Откат", uuid.New()); err == nil {
+			t.Fatal("Ожидалась ошибка внешнего ключа")
+		}
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM groups WHERE name='Откат'`).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("Группа осталась после rollback: %d, %v", count, err)
+		}
+	})
+
+	t.Run("переиспользование внешней транзакции", func(t *testing.T) {
+		rollback := errors.New("откат внешней операции")
+		var id uuid.UUID
+		err := manager.WithTx(ctx, func(txCtx context.Context) error {
+			created, err := groups.CreateGroup(txCtx, "Внешняя транзакция", owner)
+			if err != nil {
+				return err
+			}
+			id = created.ID
+			return rollback
+		})
+		if !errors.Is(err, rollback) {
+			t.Fatal(err)
+		}
+		if _, err := storage.GetGroupByID(ctx, id); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("Вложенная операция закоммитилась отдельно: %v", err)
+		}
+	})
+
+	issued, err := groups.GenerateInvite(ctx, group.ID, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("безопасное приглашение", func(t *testing.T) {
+		raw, err := base64.RawURLEncoding.DecodeString(issued.Token)
+		if err != nil || len(raw) != 32 {
+			t.Fatal("Токен должен содержать 32 случайных байта")
+		}
+		stored, err := storage.GetInvite(ctx, token.Hash(issued.Token))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.TokenHash == issued.Token || stored.CreatedBy != owner || stored.GroupID != group.ID || !stored.ExpiresAt.Equal(issued.ExpiresAt) {
+			t.Fatal("Неверные данные приглашения")
+		}
+		if remaining := time.Until(issued.ExpiresAt); remaining < 23*time.Hour+59*time.Minute || remaining > 24*time.Hour {
+			t.Fatalf("Неверный TTL: %s", remaining)
+		}
+	})
+
+	t.Run("вступление и параллельные повторы", func(t *testing.T) {
+		var wg sync.WaitGroup
+		errs := make(chan error, 8)
+		for range 8 {
+			wg.Add(1)
+			go func() { defer wg.Done(); _, err := groups.JoinByInvite(ctx, issued.Token, member); errs <- err }()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		details, err := groups.GetGroupDetails(ctx, group.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(details.Members) != 2 {
+			t.Fatalf("Участников: %d", len(details.Members))
+		}
+		if _, err := groups.JoinByInvite(ctx, issued.Token, owner); err != nil {
+			t.Fatal(err)
+		}
+		role, err := storage.GetMemberRole(ctx, group.ID, owner)
+		if err != nil || role != "owner" {
+			t.Fatalf("Повторное вступление изменило роль owner: %s, %v", role, err)
+		}
+	})
+
+	t.Run("приглашения доступны только owner", func(t *testing.T) {
+		for _, userID := range []uuid.UUID{member, outsider} {
+			if _, err := groups.GenerateInvite(ctx, group.ID, userID); !errors.Is(err, domain.ErrForbidden) {
+				t.Fatalf("Выпуск не владельцем: %v", err)
+			}
+			if err := groups.RevokeInvite(ctx, group.ID, userID); !errors.Is(err, domain.ErrForbidden) {
+				t.Fatalf("Отзыв не владельцем: %v", err)
+			}
+		}
+		if _, err := groups.GenerateInvite(ctx, uuid.New(), owner); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatal(err)
+		}
+		if err := groups.RevokeInvite(ctx, uuid.New(), owner); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("истёкшая и неизвестная ссылка", func(t *testing.T) {
+		if _, err := pool.Exec(ctx, `UPDATE group_invites SET expires_at=now()-interval '1 second' WHERE group_id=$1`, group.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := groups.JoinByInvite(ctx, issued.Token, outsider); !errors.Is(err, domain.ErrInviteExpired) {
+			t.Fatalf("Истёкшая ссылка: %v", err)
+		}
+		if _, err := groups.JoinByInvite(ctx, "unknown", outsider); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("Неизвестная ссылка: %v", err)
+		}
+		if joined, err := storage.IsUserInGroup(ctx, group.ID, outsider); err != nil || joined {
+			t.Fatal("Посторонний добавлен по неверной ссылке")
+		}
+	})
+
+	replacement, err := groups.GenerateInvite(ctx, group.ID, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.Token == issued.Token {
+		t.Fatal("Не заменён токен")
+	}
+	if _, err := groups.JoinByInvite(ctx, issued.Token, outsider); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("Старая ссылка действует: %v", err)
 	}
 
-	return pool, cleanup
+	for _, operation := range []string{"отзыв", "замена"} {
+		t.Run("вступление удерживает ссылку/"+operation, func(t *testing.T) {
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(context.Background())
+			txCtx := context.WithValue(ctx, repo.TxKey{}, tx)
+			if _, err := storage.GetInvite(txCtx, token.Hash(replacement.Token)); err != nil {
+				t.Fatal(err)
+			}
+			deadline, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+			defer cancel()
+			if operation == "отзыв" {
+				err = groups.RevokeInvite(deadline, group.ID, owner)
+			} else {
+				_, err = groups.GenerateInvite(deadline, group.ID, owner)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Операция не дождалась транзакции вступления: %v", err)
+			}
+		})
+	}
+
+	t.Run("отзыв и повторный отзыв", func(t *testing.T) {
+		for range 2 {
+			if err := groups.RevokeInvite(ctx, group.ID, owner); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := groups.JoinByInvite(ctx, replacement.Token, outsider); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("Отозванная ссылка действует: %v", err)
+		}
+	})
+
+	t.Run("список с ролью количеством и балансом", func(t *testing.T) {
+		if _, err := pool.Exec(ctx, `UPDATE groups SET created_at='2026-01-01' WHERE id=$1`, group.ID); err != nil {
+			t.Fatal(err)
+		}
+		newer, err := groups.CreateGroup(ctx, "Новая группа", owner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO balances (group_id,user_id,net) VALUES ($1,$2,-123)`, group.ID, member); err != nil {
+			t.Fatal(err)
+		}
+		list, err := groups.GetUserGroups(ctx, owner)
+		if err != nil || len(list) != 2 || list[0].ID != newer.ID || list[1].ID != group.ID || list[0].MyBalance != 0 || list[1].MembersCount != 2 || list[0].MyRole != "owner" {
+			t.Fatalf("Неверный список владельца: %+v, %v", list, err)
+		}
+		list, err = groups.GetUserGroups(ctx, member)
+		if err != nil || len(list) != 1 || list[0].MyRole != "member" || list[0].MyBalance != -123 || list[0].MembersCount != 2 {
+			t.Fatalf("Неверный список участника: %+v, %v", list, err)
+		}
+		list, err = groups.GetUserGroups(ctx, outsider)
+		if err != nil || len(list) != 0 {
+			t.Fatalf("Посторонний видит группы: %+v, %v", list, err)
+		}
+	})
 }
 
-func TestGroupRepository_Create_Integration(t *testing.T) {
-	pool, cleanup := setupTestDB(t)
-	defer cleanup()
+// Redis заменён заглушками; сервисы и PostgreSQL используются настоящие.
+type groupRateCounter struct{}
 
-	ctx := context.Background()
-	groupRepo := repo.NewGroupRepository(pool)
-
-	ownerID := uuid.New()
-	_, err := pool.Exec(ctx, "INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)", ownerID, "owner@test.com", "hash")
-	if err != nil {
-		t.Fatalf("failed to insert test user: %v", err)
-	}
-
-	group := &domain.Group{
-		ID:       uuid.New(),
-		Name:     "Test Integration Group",
-		Currency: "RUB",
-		OwnerID:  ownerID,
-	}
-
-	err = groupRepo.Create(ctx, group)
-	if err != nil {
-		t.Fatalf("Create() returned error: %v", err)
-	}
-
-	var savedName string
-	err = pool.QueryRow(ctx, "SELECT name FROM groups WHERE id = $1", group.ID).Scan(&savedName)
-	if err != nil {
-		t.Fatalf("Failed to query saved group: %v", err)
-	}
-	if savedName != group.Name {
-		t.Errorf("Expected group name %s, got %s", group.Name, savedName)
-	}
-
-	var role string
-	err = pool.QueryRow(ctx, "SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2", group.ID, ownerID).Scan(&role)
-	if err != nil {
-		t.Fatalf("Failed to query group members: %v", err)
-	}
-	if role != "owner" {
-		t.Errorf("Expected role 'owner', got %s", role)
-	}
+func (groupRateCounter) Increment(context.Context, uuid.UUID, time.Duration) (int64, time.Duration, error) {
+	return 1, time.Minute, nil
 }
 
-func TestGroupRepository_GetUserGroups_Integration(t *testing.T) {
-	pool, cleanup := setupTestDB(t)
-	defer cleanup()
+// Промах кэша заставляет каждый повтор проверять сохранённый результат в БД.
+type groupIdempotencyCache struct{}
 
-	ctx := context.Background()
-	groupRepo := repo.NewGroupRepository(pool)
-
-	// 1. Создаем тестового пользователя
-	userID := uuid.New()
-	_, err := pool.Exec(ctx, "INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)", userID, "multi@test.com", "hash")
-	if err != nil {
-		t.Fatalf("failed to insert test user: %v", err)
-	}
-
-	// 2. Создаем две группы и добавляем пользователя в обе
-	group1 := &domain.Group{ID: uuid.New(), Name: "Group A", Currency: "RUB", OwnerID: userID}
-	group2 := &domain.Group{ID: uuid.New(), Name: "Group B", Currency: "RUB", OwnerID: userID}
-
-	err = groupRepo.Create(ctx, group1)
-	if err != nil {
-		t.Fatalf("failed to create group1: %v", err)
-	}
-	err = groupRepo.Create(ctx, group2)
-	if err != nil {
-		t.Fatalf("failed to create group2: %v", err)
-	}
-
-	// 3. Тестируемое действие
-	groups, err := groupRepo.GetUserGroups(ctx, userID)
-	if err != nil {
-		t.Fatalf("GetUserGroups() returned error: %v", err)
-	}
-
-	// 4. Проверки
-	if len(groups) != 2 {
-		t.Errorf("Expected 2 groups, got %d", len(groups))
-	}
-
-	// Проверяем, что вернулись нужные имена
-	names := make(map[string]bool)
-	for _, g := range groups {
-		names[g.Name] = true
-	}
-	if !names["Group A"] || !names["Group B"] {
-		t.Errorf("Expected groups 'Group A' and 'Group B' in result, got: %v", groups)
-	}
+func (groupIdempotencyCache) CheckIdempotency(context.Context, uuid.UUID, uuid.UUID, string) (*domain.CachedResponse, error) {
+	return nil, nil
 }
 
-func TestGroupRepository_InviteFlow_Integration(t *testing.T) {
-	pool, cleanup := setupTestDB(t)
-	defer cleanup()
+func (groupIdempotencyCache) WriteIdempotency(context.Context, uuid.UUID, uuid.UUID, string, domain.CachedResponse) error {
+	return nil
+}
 
-	ctx := context.Background()
-	groupRepo := repo.NewGroupRepository(pool)
-
-	// ВАЖНО: Добавим таблицу group_invites в схему БД для этого теста,
-	// так как в setupTestDB из предыдущего сообщения мы ее не создавали.
-	// В реальном проекте эта таблица должна создаваться в рамках основной миграции.
-	_, err := pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS group_invites (
-			group_id UUID PRIMARY KEY REFERENCES groups(id) ON DELETE CASCADE,
-			token VARCHAR(255) UNIQUE NOT NULL,
-			expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-			created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-		);
-	`)
-	if err != nil {
-		t.Fatalf("failed to create group_invites table: %v", err)
+func TestGroupRoutesIntegration(t *testing.T) {
+	pool := setupUserTestDB(t)
+	storage := repo.NewGroupRepository(pool)
+	manager := repo.NewManager(pool)
+	groups := service.NewGroupService(storage, manager)
+	idempotency := service.NewIdempotencyService(repo.NewIdempotencyRepository(pool), manager)
+	owner := createGroupTestUser(t, pool, "Владелец")
+	member := createGroupTestUser(t, pool, "Участник")
+	outsider := createGroupTestUser(t, pool, "Посторонний")
+	const secret = "test-group-routes"
+	router := httptransport.NewRouter(
+		v1.NewAuthHandler(nil), v1.NewGroupHandler(groups, idempotency), v1.NewUserHandler(nil),
+		middleware.NewAuthMiddleware(secret), middleware.NewRateLimitMiddleware(groupRateCounter{}, 30, time.Minute),
+		middleware.NewIdempotencyMiddleware(groupIdempotencyCache{}), storage,
+	)
+	call := func(method, path, body string, userID uuid.UUID, want int, key ...string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		if len(key) > 0 {
+			req.Header.Set("Idempotency-Key", key[0])
+		}
+		if userID != uuid.Nil {
+			signed, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"sub": userID.String(), "exp": time.Now().Add(time.Minute).Unix()}).SignedString([]byte(secret))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+signed)
+		}
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		if rr.Code != want {
+			t.Fatalf("%s %s: ожидался %d, получено %d: %s", method, path, want, rr.Code, rr.Body.String())
+		}
+		if want == 204 {
+			if rr.Body.Len() != 0 {
+				t.Fatal("Ответ 204 содержит тело")
+			}
+		} else if want != 404 || strings.HasPrefix(rr.Body.String(), "{") {
+			if rr.Header().Get("Content-Type") != "application/json" {
+				t.Fatal("Нет JSON Content-Type")
+			}
+		}
+		return rr
+	}
+	created := call("POST", "/api/v1/groups", `{"name":"Поездка"}`, owner, 201)
+	var group struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		Members   []struct {
+			UserID uuid.UUID `json:"user_id"`
+			Name   string    `json:"name"`
+			Role   string    `json:"role"`
+		} `json:"members"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &group); err != nil {
+		t.Fatal(err)
+	}
+	if group.ID == uuid.Nil || group.CreatedAt.IsZero() || len(group.Members) != 1 || group.Members[0].UserID != owner || group.Members[0].Name != "Владелец" || group.Members[0].Role != "owner" {
+		t.Fatal("Неверный ответ создания")
+	}
+	path := "/api/v1/groups/" + group.ID.String()
+	call("GET", path, "", owner, 200)
+	call("GET", path, "", outsider, 403)
+	call("GET", "/api/v1/groups/"+uuid.NewString(), "", owner, 404)
+	call("GET", "/api/v1/groups/wrong", "", owner, 400)
+	call("GET", path, "", uuid.Nil, 401)
+	inviteResponse := call("POST", path+"/invite", "", owner, 201)
+	var invite struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(inviteResponse.Body.Bytes(), &invite); err != nil || invite.Token == "" {
+		t.Fatal("Нет токена приглашения")
+	}
+	body := `{"token":"` + invite.Token + `"}`
+	joined := call("POST", "/api/v1/groups/join", body, member, 200)
+	if strings.Contains(joined.Body.String(), "email") || strings.Contains(joined.Body.String(), "owner_id") || strings.Contains(joined.Body.String(), "currency") {
+		t.Fatal("В ответе лишние поля")
+	}
+	call("POST", "/api/v1/groups/join", body, member, 200)
+	call("POST", path+"/invite", "", member, 403)
+	call("DELETE", path+"/invite", "", member, 403)
+	call("POST", path+"/invites", "", owner, 404)
+	call("DELETE", path+"/invite", "", owner, 204)
+	call("DELETE", path+"/invite", "", owner, 204)
+	call("POST", "/api/v1/groups/join", body, outsider, 404)
+	list := call("GET", "/api/v1/groups", "", member, 200)
+	var response struct {
+		Items []struct {
+			ID           uuid.UUID `json:"id"`
+			MyRole       string    `json:"my_role"`
+			MembersCount int64     `json:"members_count"`
+			MyBalance    int64     `json:"my_balance"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &response); err != nil || len(response.Items) != 1 || response.Items[0].MyRole != "member" || response.Items[0].MembersCount != 2 || response.Items[0].MyBalance != 0 {
+		t.Fatalf("Неверный ответ списка: %s", list.Body.String())
 	}
 
-	// 1. Подготовка: Владелец и Группа
-	ownerID := uuid.New()
-	_, err = pool.Exec(ctx, "INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)", ownerID, "invite_owner@test.com", "hash")
-	if err != nil {
-		t.Fatalf("failed to insert owner: %v", err)
-	}
-
-	groupID := uuid.New()
-	group := &domain.Group{ID: groupID, Name: "Invite Test Group", Currency: "RUB", OwnerID: ownerID}
-	if err := groupRepo.Create(ctx, group); err != nil {
-		t.Fatalf("failed to create group: %v", err)
-	}
-
-	// 2. Подготовка: Новый пользователь (будущий участник)
-	memberID := uuid.New()
-	_, err = pool.Exec(ctx, "INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)", memberID, "new_member@test.com", "hash")
-	if err != nil {
-		t.Fatalf("failed to insert member: %v", err)
-	}
-
-	// 3. ТЕСТ: UpsertInvite
-	token := "secure-invite-token-123"
-	expiresAt := time.Now().Add(24 * time.Hour)
-	err = groupRepo.UpsertInvite(ctx, groupID, token, expiresAt)
-	if err != nil {
-		t.Fatalf("UpsertInvite() returned error: %v", err)
-	}
-
-	// Проверяем, что инвайт сохранился
-	var savedGroupID uuid.UUID
-	err = pool.QueryRow(ctx, "SELECT group_id FROM group_invites WHERE token = $1", token).Scan(&savedGroupID)
-	if err != nil {
-		t.Fatalf("Failed to find inserted invite in DB: %v", err)
-	}
-	if savedGroupID != groupID {
-		t.Errorf("Expected invite for group %s, got %s", groupID, savedGroupID)
-	}
-
-	// 4. ТЕСТ: GetInvite
-	invite, err := groupRepo.GetInvite(ctx, token)
-	if err != nil {
-		t.Fatalf("GetInvite() returned error: %v", err)
-	}
-	if invite.GroupID != groupID {
-		t.Errorf("Expected invite group %s, got %s", groupID, invite.GroupID)
-	}
-	if invite.Token != token {
-		t.Errorf("Expected token %s, got %s", token, invite.Token)
-	}
-
-	// 5. ТЕСТ: AddUserToGroup
-	err = groupRepo.AddUserToGroup(ctx, groupID, memberID)
-	if err != nil {
-		t.Fatalf("AddUserToGroup() returned error: %v", err)
-	}
-
-	// Проверяем, что пользователь реально добавлен
-	var role string
-	err = pool.QueryRow(ctx, "SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2", groupID, memberID).Scan(&role)
-	if err != nil {
-		t.Fatalf("Failed to query new group member: %v", err)
-	}
-	if role != "member" {
-		t.Errorf("Expected role 'member', got %s", role)
-	}
-
-	// 6. ТЕСТ: IsUserInGroup
-	inGroup, err := groupRepo.IsUserInGroup(ctx, groupID, memberID)
-	if err != nil {
-		t.Fatalf("IsUserInGroup() returned error: %v", err)
-	}
-	if !inGroup {
-		t.Error("IsUserInGroup() returned false, expected true for added member")
+	// Идемпотентное создание проверяется через PostgreSQL при каждом запросе.
+	{
+		key := uuid.NewString()
+		body := `{"name":"Идемпотентная группа"}`
+		first := call("POST", "/api/v1/groups", body, owner, 201, key)
+		var initial struct {
+			ID      uuid.UUID         `json:"id"`
+			Members []json.RawMessage `json:"members"`
+		}
+		if err := json.Unmarshal(first.Body.Bytes(), &initial); err != nil {
+			t.Fatal(err)
+		}
+		// После изменения группы повтор должен вернуть первоначальный состав.
+		issued, err := groups.GenerateInvite(context.Background(), initial.ID, owner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := groups.JoinByInvite(context.Background(), issued.Token, member); err != nil {
+			t.Fatal(err)
+		}
+		repeated := call("POST", "/api/v1/groups", body, owner, 201, key)
+		var got struct {
+			ID      uuid.UUID         `json:"id"`
+			Members []json.RawMessage `json:"members"`
+		}
+		if err := json.Unmarshal(repeated.Body.Bytes(), &got); err != nil || got.ID != initial.ID || len(got.Members) != 1 {
+			t.Fatalf("Повтор не вернул первоначальную группу: %s, %v", repeated.Body.String(), err)
+		}
+		for _, changed := range []string{`{"name":"Другая"}`, `{"name":""}`, `{`} {
+			mismatch := call("POST", "/api/v1/groups", changed, owner, 422, key)
+			if !strings.Contains(mismatch.Body.String(), `"code":"idempotency_key_mismatch"`) {
+				t.Fatalf("Неверная ошибка повтора: %s", mismatch.Body.String())
+			}
+		}
+		// Область ключа ограничена пользователем.
+		other := call("POST", "/api/v1/groups", body, outsider, 201, key)
+		if err := json.Unmarshal(other.Body.Bytes(), &got); err != nil || got.ID == initial.ID {
+			t.Fatalf("Пользователи разделили один результат: %s, %v", other.Body.String(), err)
+		}
 	}
 }
